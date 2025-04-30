@@ -1,0 +1,9 @@
+{
+  "input_dir": "",
+  "output_dir": "",
+  "trash_dir": "",
+  "prohibit_extraction": false,
+  "prohibit_downloads": false,
+  "prohibit_encoding": false,
+  "allow_generation": true
+}
