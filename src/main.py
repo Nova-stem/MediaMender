@@ -1,7 +1,7 @@
 # src/main.py
 
 import sys, os, json
-from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QTableWidgetItem, QTableWidget, QVBoxLayout, QPushButton, QWidget, QProgressBar, QLabel, QComboBox, QMessageBox
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QTableWidgetItem, QTableWidget, QVBoxLayout, QPushButton, QWidget, QProgressBar, QLabel, QComboBox, QMessageBox, QAbstractItemView
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction, QPalette, QIcon
 from src.theme_manager import apply_theme
@@ -101,13 +101,20 @@ class MediaMender(QMainWindow):
         self.filter_combo.addItems(["All", "Movie", "TV Show", "Audiobook"])
         layout.addWidget(self.filter_combo)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Filename", "Type", "Status"])
-
-        # Get theme-aware border color (higher contrast than Mid)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["#", "Filename", "Type", "Status"])
+        self.table.setSortingEnabled(False)
+        self.table.setDragDropMode(QAbstractItemView.InternalMove)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setDragDropOverwriteMode(False)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDefaultDropAction(Qt.MoveAction)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         border_color = self.palette().color(QPalette.Light).name()
 
         header = self.table.horizontalHeader()
+        header.sectionClicked.connect(self.renumber_table)
+        header.sectionClicked.connect(self.on_header_clicked)
         header.setStyleSheet(
             f"""
             QHeaderView::section {{
@@ -189,13 +196,26 @@ class MediaMender(QMainWindow):
         for i, file_path in enumerate(self.files):
             file_name = Path(file_path).name
             media_type = detect_media_type(Path(file_path))
+            index_item = QTableWidgetItem()
+            index_item.setData(Qt.DisplayRole, i + 1)
             name_item = QTableWidgetItem(file_name)
             type_item = QTableWidgetItem(media_type)
             status_item = QTableWidgetItem("Pending")
 
-            self.table.setItem(i, 0, name_item)
-            self.table.setItem(i, 1, type_item)
-            self.table.setItem(i, 2, status_item)
+            self.table.setItem(i, 0, index_item)
+            self.table.setItem(i, 1, name_item)
+            self.table.setItem(i, 2, type_item)
+            self.table.setItem(i, 3, status_item)
+
+        self.table.sortItems(-1)
+        self.table.setSortingEnabled(True)
+        self.renumber_table()
+
+    def renumber_table(self):
+        for row in range(self.table.rowCount()):
+            item = QTableWidgetItem()
+            item.setData(Qt.DisplayRole, row + 1)
+            self.table.setItem(row, 0, item)
 
     def start_processing(self):
         if not self.files:
@@ -210,6 +230,7 @@ class MediaMender(QMainWindow):
             dialog.setStyle(self.style())  # Ensure style inheritance
             dialog.exec()
             return
+        self.update_file_order()
         self.worker = WorkerThread(self.files, self.output_dir, self.trash_dir, self.log_dir)
         self.worker.update_progress.connect(self.update_progress)
         self.worker.file_done.connect(self.mark_file)
@@ -245,6 +266,25 @@ class MediaMender(QMainWindow):
         self.trash_dir = Path(config["trash_dir"])
         self.log_dir = Path(config["log_dir"])
         return True
+
+    def update_file_order(self):
+        new_order = []
+        seen = set()
+        for row in range(self.table.rowCount()):
+            filename = self.table.item(row, 1).text()
+            for f in self.files:
+                if Path(f).name == filename and f not in seen:
+                    new_order.append(f)
+                    seen.add(f)
+                    break
+        self.files = new_order
+        self.renumber_table()
+
+    def on_header_clicked(self, index):
+        if index == 0:
+            self.table.setDragDropMode(QAbstractItemView.InternalMove)
+        else:
+            self.table.setDragDropMode(QAbstractItemView.NoDragDrop)
 
     def closeEvent(self, event):
         widths = [self.table.columnWidth(i) for i in range(self.table.columnCount())]
