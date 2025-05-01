@@ -17,6 +17,7 @@ from datetime import datetime
 from src.preferences import get_log_path, _load_config, _write_config
 from src.dialog import ThemedMessage
 from src.processing.media_processor import detect_media_type
+from src.drag_drop_table import DragDropTableWidget
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 
@@ -101,7 +102,8 @@ class MediaMender(QMainWindow):
         self.filter_combo.addItems(["All", "Movie", "TV Show", "Audiobook"])
         layout.addWidget(self.filter_combo)
 
-        self.table = QTableWidget(0, 4)
+        self.table = DragDropTableWidget()
+        self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["#", "Filename", "Type", "Status"])
         self.table.setSortingEnabled(False)
         self.table.setDragDropMode(QAbstractItemView.InternalMove)
