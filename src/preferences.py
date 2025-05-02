@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QFileDialog, QCheckBox, QMessageBox, QComboBox
+    QFileDialog, QCheckBox, QComboBox
 )
 from src.theme_manager import ThemeMode
 from src.dialog import ThemedMessage
@@ -27,6 +27,7 @@ class PreferencesWindow(QDialog):
         self.tmdb_api_field = self.create_path_field("TMDb API Key", self.config.get("tmdb_api_key", ""))
         self.log_path_field = self.create_path_field("Log Folder", self.config.get("log_dir", "logs"))
 
+
         layout.addLayout(self.input_field["layout"])
         layout.addLayout(self.output_field["layout"])
         layout.addLayout(self.trash_field["layout"])
@@ -44,21 +45,36 @@ class PreferencesWindow(QDialog):
         if index >= 0:
             self.theme_combo.setCurrentIndex(index)
 
+        layout.addWidget(QLabel("Whisper Model:"))
+        self.whisper_model_combo = QComboBox()
+        self.whisper_model_combo.addItem("Tiny (fastest, lowest accuracy)", "tiny")
+        self.whisper_model_combo.addItem("Base (fast, good accuracy)", "base")
+        self.whisper_model_combo.addItem("Small (balanced)", "small")
+        self.whisper_model_combo.addItem("Medium (slow, high accuracy)", "medium")
+        self.whisper_model_combo.addItem("Large (slowest, best accuracy)", "large")
+        selected_model = self.config.get("whisper_model", "base")
+        index = self.whisper_model_combo.findText(selected_model)
+        self.whisper_model_combo.setCurrentIndex(index if index >= 0 else 1)
+
+        layout.addWidget(self.whisper_model_combo)
         # Processing flags
-        self.prohibit_extraction = QCheckBox("Prohibit Extraction")
-        self.prohibit_downloads = QCheckBox("Prohibit Downloads")
-        self.prohibit_encoding = QCheckBox("Prohibit Encoding")
+        #self.prohibit_extraction = QCheckBox("Prohibit Extraction")
+        #self.prohibit_downloads = QCheckBox("Prohibit Downloads")
+        #self.prohibit_encoding = QCheckBox("Prohibit Encoding")
         self.allow_generation = QCheckBox("Allow Generation")
+        self.dry_run_checkbox = QCheckBox("Enable Dry Run (no file changes)")
 
-        self.prohibit_extraction.setChecked(self.config.get("prohibit_extraction", False))
-        self.prohibit_downloads.setChecked(self.config.get("prohibit_downloads", False))
-        self.prohibit_encoding.setChecked(self.config.get("prohibit_encoding", False))
+        #self.prohibit_extraction.setChecked(self.config.get("prohibit_extraction", False))
+        #self.prohibit_downloads.setChecked(self.config.get("prohibit_downloads", False))
+        #self.prohibit_encoding.setChecked(self.config.get("prohibit_encoding", False))
         self.allow_generation.setChecked(self.config.get("allow_generation", True))
+        self.dry_run_checkbox.setChecked(self.config.get("dry_run", False))
 
-        layout.addWidget(self.prohibit_extraction)
-        layout.addWidget(self.prohibit_downloads)
-        layout.addWidget(self.prohibit_encoding)
+        #layout.addWidget(self.prohibit_extraction)
+        #layout.addWidget(self.prohibit_downloads)
+        #layout.addWidget(self.prohibit_encoding)
         layout.addWidget(self.allow_generation)
+        layout.addWidget(self.dry_run_checkbox)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -102,10 +118,12 @@ class PreferencesWindow(QDialog):
         self.config["trash_dir"] = self.trash_field["field"].text()
         self.config["tmdb_api_key"] = self.tmdb_api_field["field"].text()
         self.config["log_dir"] = self.log_path_field["field"].text()
-        self.config["prohibit_extraction"] = self.prohibit_extraction.isChecked()
-        self.config["prohibit_downloads"] = self.prohibit_downloads.isChecked()
-        self.config["prohibit_encoding"] = self.prohibit_encoding.isChecked()
+        self.config["whisper_model"] = self.whisper_model_combo.currentText()
+        #self.config["prohibit_extraction"] = self.prohibit_extraction.isChecked()
+        #self.config["prohibit_downloads"] = self.prohibit_downloads.isChecked()
+        #self.config["prohibit_encoding"] = self.prohibit_encoding.isChecked()
         self.config["allow_generation"] = self.allow_generation.isChecked()
+        self.config["dry_run"] = self.dry_run_checkbox.isChecked()
         self.config["theme"] = self.theme_combo.currentText().lower()
 
         os.makedirs(CONFIG_PATH.parent, exist_ok=True)
@@ -160,3 +178,11 @@ def get_log_path() -> Path:
     path = Path(raw)
     path.mkdir(exist_ok=True, parents=True)
     return path
+
+def get_whisper_model() -> str:
+    config = _load_config()
+    return config.get("whisper_model", "base")
+
+def is_generation_allowed() -> bool:
+    config = _load_config()
+    return config.get("allow_generation", False)

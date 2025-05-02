@@ -1,23 +1,24 @@
 # src/main.py
 
 import sys, os, json
-from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QTableWidgetItem, QTableWidget, QVBoxLayout, QPushButton, QWidget, QProgressBar, QLabel, QComboBox, QMessageBox, QAbstractItemView
+from PySide6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QVBoxLayout, QPushButton, QWidget, QProgressBar, QLabel, QComboBox, QAbstractItemView, QHeaderView
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QPalette, QIcon
+from PySide6.QtGui import QAction, QPalette, QIcon, QStandardItem
 from src.theme_manager import apply_theme
 #from src.theme import apply_system_theme
 from src.style import get_base_stylesheet
 from preferences import PreferencesWindow, load_theme
 from src.processing.media_processor import process_media
 #import configparser
-from src.preferences import load_column_widths, save_column_widths
+from src.preferences import load_column_widths, save_column_widths, get_whisper_model
 from pathlib import Path
 import logging
 from datetime import datetime
-from src.preferences import get_log_path, _load_config, _write_config
+from src.preferences import get_log_path, _load_config
 from src.dialog import ThemedMessage
 from src.processing.media_processor import detect_media_type
-from src.drag_drop_table import DragDropTableWidget
+from src.drag_drop_table import DragDropSortableTable, NoFocusDelegate
+from src.processing.common_utils import ensure_whisper_model_installed
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 
@@ -37,12 +38,13 @@ class WorkerThread(QThread):
     update_progress = Signal(int, str)
     file_done = Signal(int, bool)
 
-    def __init__(self, files, output_dir, trash_dir, log_dir):
+    def __init__(self, files, output_dir, trash_dir, log_dir, dry_run=False):
         super().__init__()
         self.files = files
         self.output_dir = output_dir
         self.trash_dir = trash_dir
         self.log_dir = log_dir
+        self.dry_run = dry_run
         self.running = True
 
     def run(self):
@@ -54,22 +56,16 @@ class WorkerThread(QThread):
             self.update_progress.emit(int((i + 1) / len(self.files) * 100), filename)
 
             try:
-                process_media(Path(file), self.output_dir)
-                logging.info(f"Processed file: {filename}")
-                success = True
+                if self.dry_run:
+                    logging.info(f"[DRY RUN] Would process: {filename}")
+                    success = True
+                else:
+                    process_media(Path(file), self.output_dir)
+                    logging.info(f"Processed file: {filename}")
+                    success = True
             except Exception as e:
                 logging.exception(f"Error processing {filename}")
                 success = False
-            #try:
-            #    media_type = detect_media_type(Path(file))
-            #    self.table.item(i, 1).setText(media_type.capitalize())  # ← set type in table
-
-            #    process_media(Path(file), self.output_dir)
-            #    success = True
-            #except Exception as e:
-            #    logging.exception(f"❌ Error processing {filename}")
-            #    self.table.item(i, 2).setText("Errored")
-            #    success = False
 
             self.file_done.emit(i, success)
 
@@ -96,48 +92,48 @@ class MediaMender(QMainWindow):
         settings_menu.addAction(preferences_action)
 
         central = QWidget()
+        central.setAcceptDrops(True)
         layout = QVBoxLayout()
 
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["All", "Movie", "TV Show", "Audiobook"])
         layout.addWidget(self.filter_combo)
 
-        self.table = DragDropTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["#", "Filename", "Type", "Status"])
-        self.table.setSortingEnabled(False)
-        self.table.setDragDropMode(QAbstractItemView.InternalMove)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setDragDropOverwriteMode(False)
-        self.table.setDropIndicatorShown(True)
-        self.table.setDefaultDropAction(Qt.MoveAction)
+        self.table = DragDropSortableTable()
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setItemDelegate(NoFocusDelegate())
+
         border_color = self.palette().color(QPalette.Light).name()
 
         header = self.table.horizontalHeader()
         header.sectionClicked.connect(self.renumber_table)
-        header.sectionClicked.connect(self.on_header_clicked)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)  # Allow manual resizing
+        header.setSectionsClickable(True)
+        header.setStretchLastSection(False)  # Keep fixed widths
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Column 0 (the "#" column)
         header.setStyleSheet(
             f"""
             QHeaderView::section {{
                 border: 1px solid {border_color};
                 padding: 4px;
                 text-align: left;
+                font-weight: normal;
             }}
             """
         )
 
+
+
         # Left-align headers
-        for i in range(self.table.columnCount()):
-            item = self.table.horizontalHeaderItem(i)
-            if item:
-                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        for i in range(self.table.model.columnCount()):
+            header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # Restore saved column widths
         saved_widths = load_column_widths()
         if saved_widths:
-            for i, width in enumerate(saved_widths):
-                if i < self.table.columnCount():
+            for i, width in enumerate(saved_widths, start=1):  # start at 1 to skip column 0
+                if i < self.table.model.columnCount():
                     self.table.setColumnWidth(i, width)
 
         # Stretch last column
@@ -190,34 +186,22 @@ class MediaMender(QMainWindow):
             str(f) for f in input_dir.glob("*") if f.is_file()
         ]
 
-        self.table.setRowCount(len(self.files))
-        #for i, file in enumerate(self.files):
-        #    name_item = QTableWidgetItem(Path(file).name)
-        #    type_item = QTableWidgetItem("Unknown")
-        #    status_item = QTableWidgetItem("Pending")
-        for i, file_path in enumerate(self.files):
+        self.files.sort(key=lambda path: Path(path).name.lower())  # Case-insensitive sort by filename
+
+        self.table.model.removeRows(0, self.table.model.rowCount())
+        for file_path in self.files:
             file_name = Path(file_path).name
             media_type = detect_media_type(Path(file_path))
-            index_item = QTableWidgetItem()
-            index_item.setData(Qt.DisplayRole, i + 1)
-            name_item = QTableWidgetItem(file_name)
-            type_item = QTableWidgetItem(media_type)
-            status_item = QTableWidgetItem("Pending")
-
-            self.table.setItem(i, 0, index_item)
-            self.table.setItem(i, 1, name_item)
-            self.table.setItem(i, 2, type_item)
-            self.table.setItem(i, 3, status_item)
-
-        self.table.sortItems(-1)
-        self.table.setSortingEnabled(True)
-        self.renumber_table()
+            self.table.add_row([file_name, media_type, "Pending"])
 
     def renumber_table(self):
-        for row in range(self.table.rowCount()):
-            item = QTableWidgetItem()
-            item.setData(Qt.DisplayRole, row + 1)
-            self.table.setItem(row, 0, item)
+        #for row in range(self.table.rowCount()):
+        for row in range(self.table.model.rowCount()):
+            item = QStandardItem(str(row + 1))
+            item.setEditable(False)
+            item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.table.model.setItem(row, 0, item)
+        self.table.resizeColumnToContents(0)
 
     def start_processing(self):
         if not self.files:
@@ -232,8 +216,15 @@ class MediaMender(QMainWindow):
             dialog.setStyle(self.style())  # Ensure style inheritance
             dialog.exec()
             return
+        model = get_whisper_model()
+        if not ensure_whisper_model_installed(model, self.update_progress):
+            dialog = ThemedMessage("Model Error", "Whisper model installation failed. Cannot continue.", self)
+            dialog.exec()
+            return
+        self.lock_table()
+
         self.update_file_order()
-        self.worker = WorkerThread(self.files, self.output_dir, self.trash_dir, self.log_dir)
+        self.worker = WorkerThread(self.files, self.output_dir, self.trash_dir, self.log_dir, self.dry_run)
         self.worker.update_progress.connect(self.update_progress)
         self.worker.file_done.connect(self.mark_file)
         self.worker.start()
@@ -245,6 +236,21 @@ class MediaMender(QMainWindow):
             self.worker.wait()
             self.status_label.setText("Stopped")
             self.progress.setValue(0)
+            self.unlock_table()
+
+    def lock_table(self):
+        self.table.setSortingEnabled(False)
+        self.table.setDragEnabled(False)
+        self.table.setAcceptDrops(False)
+        self.table.setDropIndicatorShown(False)
+        #self.table.model.setSupportedDragActions(Qt.NoAction)
+
+    def unlock_table(self):
+        self.table.setSortingEnabled(True)
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        #self.table.model.setSupportedDragActions(Qt.MoveAction)
 
     def update_progress(self, value, filename):
         self.progress.setValue(value)
@@ -253,10 +259,10 @@ class MediaMender(QMainWindow):
     def mark_file(self, row, success):
         color = "#98FB98" if success else "#FF7F7F"
         for col in range(3):
-            item = self.table.item(row, col)
+            item = self.table.model.item(row, col)
             if item:
                 item.setBackground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
-        self.table.setItem(row, 2, QTableWidgetItem("Done" if success else "Errored"))
+        self.table.model.setItem(row, 3, QStandardItem("Done" if success else "Errored"))
 
     def check_required_paths(self) -> bool:
         config = _load_config()
@@ -264,16 +270,17 @@ class MediaMender(QMainWindow):
         missing = [key for key in required_keys if not config.get(key) or not Path(config[key]).exists()]
         if missing:
             return False
-        self.output_dir = Path(config["output_dir"])
-        self.trash_dir = Path(config["trash_dir"])
-        self.log_dir = Path(config["log_dir"])
+        self.output_dir = Path(config.get("output_dir", "output"))
+        self.trash_dir = Path(config.get("trash_dir", "trash"))
+        self.log_dir = Path(config.get("log_dir", "logs"))
+        self.dry_run = config.get("dry_run", True)
         return True
 
     def update_file_order(self):
         new_order = []
         seen = set()
-        for row in range(self.table.rowCount()):
-            filename = self.table.item(row, 1).text()
+        for row in range(self.table.model.rowCount()):
+            filename = self.table.model.item(row, 1).text()
             for f in self.files:
                 if Path(f).name == filename and f not in seen:
                     new_order.append(f)
@@ -282,16 +289,43 @@ class MediaMender(QMainWindow):
         self.files = new_order
         self.renumber_table()
 
-    def on_header_clicked(self, index):
-        if index == 0:
-            self.table.setDragDropMode(QAbstractItemView.InternalMove)
+    def dropEvent(self, event):
+        if not self.table.selectedIndexes():
+            return
+
+        global_pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+        if self.table.is_cursor_within_viewport(global_pos):
+            return  # Let the table handle it normally
+
+        cursor_pos = self.table.mapFromGlobal(global_pos)
+        if cursor_pos.y() < 0:
+            target_row = 0
+        elif cursor_pos.y() > self.table.viewport().height():
+            target_row = self.table.model.rowCount()
         else:
-            self.table.setDragDropMode(QAbstractItemView.NoDragDrop)
+            return
+
+        source_row = self.table.selectedIndexes()[0].row()
+        if target_row > source_row:
+            target_row -= 1
+
+        items = [self.table.model.item(source_row, col).clone() for col in range(self.table.model.columnCount())]
+        self.table.model.removeRow(source_row)
+        self.table.model.insertRow(target_row, items)
+        self.table.renumber_rows()
+
+        self.table._drag_hover_pos = None
+        self.table.viewport().update()
+        event.acceptProposedAction()
+
+    def dragEnterEvent(self, event):
+        event.acceptProposedAction()
 
     def closeEvent(self, event):
-        widths = [self.table.columnWidth(i) for i in range(self.table.columnCount())]
+        widths = [self.table.columnWidth(i) for i in range(1, self.table.model.columnCount())]
         save_column_widths(widths)
-        event.accept()
+        super().closeEvent(event)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

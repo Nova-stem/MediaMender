@@ -122,4 +122,7 @@ def get_base_stylesheet() -> str:
     border-radius: 4px;
     padding: 4px;
     }
+    QTableWidget::item:focus {
+        outline: none;
+    }
     """
