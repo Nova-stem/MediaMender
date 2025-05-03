@@ -11,10 +11,10 @@ from src.processing.common_utils import (
     detect_source_format,
     sanitize_filename,
     prepare_subtitles_for_muxing,
-    move_to_trash
+    move_to_trash, get_output_path_for_media
 )
 
-def process_tv(file_path: Path, output_dir: Path, trash_dir: Path, dry_run: bool):
+def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run: bool):
     logging.info(f"📺 [TV] Starting: {file_path.name}")
 
     # 1. Metadata from filename
@@ -39,12 +39,19 @@ def process_tv(file_path: Path, output_dir: Path, trash_dir: Path, dry_run: bool
     aspect = detect_aspect_ratio(file_path)
     source = detect_source_format(file_path.name)
 
-    final_name = f"{safe_title} {ep_code}"
-    if safe_ep_title:
-        final_name += f" - {safe_ep_title}"
-    final_name += f" [{source}][{aspect}].mkv"
+    output_dir = get_output_path_for_media("show", {
+        "show_title": show_title,
+        "season_number": season
+    }, base_output_dir)
 
-    output_path = output_dir / final_name
+    safe_title = sanitize_filename(show_title)
+    safe_ep_title = sanitize_filename(episode_title)
+    output_name = f"{safe_title} - S{int(season):02d}E{int(episode):02d} - {safe_ep_title}.mkv"
+    output_path = output_dir / output_name
+
+    if output_path.exists():
+        logging.info(f"⏩ Skipping: output already exists at {output_path}")
+        return
 
     # 4. Subtitles: convert, clean, tag
     subtitle_tracks = prepare_subtitles_for_muxing(file_path, trash_dir, dry_run)

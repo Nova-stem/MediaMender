@@ -9,10 +9,11 @@ from src.processing.common_utils import (
     detect_source_format,
     sanitize_filename,
     prepare_subtitles_for_muxing,
-    move_to_trash
+    move_to_trash,
+    get_output_path_for_media
 )
 
-def process_movie(file_path: Path, output_dir: Path, trash_dir: Path, dry_run: bool):
+def process_movie(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run: bool):
     logging.info(f"🎬 [Movie] Starting: {file_path.name}")
 
     # 1. Metadata
@@ -25,9 +26,15 @@ def process_movie(file_path: Path, output_dir: Path, trash_dir: Path, dry_run: b
     source = detect_source_format(file_path.name)
 
     # 2. Output path
+    output_dir = get_output_path_for_media("movie", metadata, base_output_dir)
+
     safe_title = sanitize_filename(title)
     output_name = f"{safe_title} ({year}) [{source}][{aspect}].mkv"
     output_path = output_dir / output_name
+
+    if output_path.exists():
+        logging.info(f"⏩ Skipping: output already exists at {output_path}")
+        return
 
     # 3. Subtitles
     subtitle_tracks = prepare_subtitles_for_muxing(file_path, trash_dir, dry_run)

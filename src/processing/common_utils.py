@@ -1,8 +1,9 @@
 # src/processing/common_utils.py
-
+import json
 import re
 import platform
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Any
@@ -16,7 +17,12 @@ import difflib
 from faster_whisper import WhisperModel
 from srt import Subtitle, compose
 import datetime
+from datetime import time
+import zipfile
+import urllib.request
 
+FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_TARGET = Path("resources/ffmpeg/ffmpeg.exe")
 _ignored_names_cache = None
 
 def load_ignored_names() -> set[str]:
@@ -385,17 +391,29 @@ def find_all_subtitles(file_path: Path, threshold: float = 0.75) -> list[dict]:
 
 def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool):
     """
-    Moves a file to the specified trash directory. Honors dry run.
+    Moves a file to the specified trash directory. Honors dry run and safety checks.
     """
     if not file_path.exists():
         return
-    if dry_run:
-        logging.info(f"[DRY RUN] Would move to trash: {file_path}")
+    if not is_safe_to_trash(file_path):
+        logging.warning(f"❌ Skipped trashing unsafe file: {file_path}")
         return
+
     trash_dir.mkdir(parents=True, exist_ok=True)
     dest = trash_dir / file_path.name
+
+    # Handle filename collision in trash
+    counter = 1
+    while dest.exists():
+        dest = trash_dir / f"{file_path.stem}_{counter}{file_path.suffix}"
+        counter += 1
+
+    if dry_run:
+        logging.info(f"[DRY RUN] Would move to trash: {file_path} → {dest}")
+        return
+
     file_path.rename(dest)
-    logging.info(f"🗑️ Moved to trash: {file_path.name}")
+    logging.info(f"🗑️ Moved to trash: {file_path.name} → {dest.name}")
 
 def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
     from src.preferences import get_whisper_model
@@ -471,15 +489,17 @@ def get_whisper_model_dir() -> Path:
     else:
         return Path.home() / ".mediamender" / "models"
 
-def ensure_whisper_model_installed(model: str, progress_callback=None) -> bool:
-    """
-    Ensures the Whisper model is downloaded to the system-wide model folder.
-    Accepts an optional progress_callback(percentage: int, message: str).
-    Returns True if model is available or successfully installed, else False.
-    """
+def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: bool = False) -> bool:
     model_dir = get_whisper_model_dir() / model
     if model_dir.exists() and any(model_dir.iterdir()):
-        return True  # already present
+        logging.info(f"✅ Whisper model '{model}' already installed.")
+        return True
+
+    if dry_run:
+        logging.info(f"[DRY RUN] Whisper model '{model}' not found. Would download to: {model_dir}")
+        if progress_callback:
+            progress_callback(0, f"[DRY RUN] Would install Whisper model '{model}'.")
+        return True
 
     try:
         logging.info(f"🔽 Downloading Whisper model: {model} to {model_dir}")
@@ -497,4 +517,272 @@ def ensure_whisper_model_installed(model: str, progress_callback=None) -> bool:
         logging.error(f"❌ Failed to download Whisper model '{model}': {e}")
         if progress_callback:
             progress_callback(0, f"Failed to install Whisper model: {e}")
+        return False
+
+def find_ffmpeg_path() -> str:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return "ffmpeg"  # found in PATH
+    except Exception:
+        fallback = Path("resources/ffmpeg/ffmpeg.exe")
+        if fallback.exists():
+            return str(fallback)
+
+        return None
+
+def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False) -> str | None:
+    # 1. Check system PATH
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        logging.info("✅ FFmpeg found in system PATH.")
+        return "ffmpeg"
+    except Exception:
+        pass
+
+    # 2. Check local install
+    if FFMPEG_TARGET.exists():
+        logging.info("✅ FFmpeg found in local resources.")
+        return str(FFMPEG_TARGET)
+
+    if dry_run:
+        logging.info("[DRY RUN] FFmpeg not found. Would download and install to resources/ffmpeg/")
+        if progress_callback:
+            progress_callback(0, "[DRY RUN] Would install FFmpeg.")
+        return str(FFMPEG_TARGET)
+
+    # 3. Download and install
+    try:
+        if progress_callback:
+            progress_callback(0, "Downloading FFmpeg...")
+
+        zip_path = Path("ffmpeg_tmp.zip")
+        urllib.request.urlretrieve(FFMPEG_URL, zip_path)
+
+        if progress_callback:
+            progress_callback(30, "Extracting FFmpeg...")
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall("ffmpeg_tmp")
+
+        extracted = next(Path("ffmpeg_tmp").rglob("ffmpeg.exe"))
+        FFMPEG_TARGET.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(extracted, FFMPEG_TARGET)
+
+        # Clean up
+        shutil.rmtree("ffmpeg_tmp")
+        zip_path.unlink()
+
+        if progress_callback:
+            progress_callback(100, "FFmpeg installed.")
+        return str(FFMPEG_TARGET)
+
+    except Exception as e:
+        logging.error(f"❌ Failed to install FFmpeg: {e}")
+        if progress_callback:
+            progress_callback(0, "Failed to install FFmpeg.")
+        return None
+
+def parse_chapters_from_srt(srt_path: Path) -> list[tuple[float, float]]:
+    """
+    Detect chapters from SRT by looking for major time gaps or keyword lines.
+    """
+    chapters = []
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+        times = []
+        keywords = []
+
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                start = line.split("-->")[0].strip()
+                h, m, s = re.split("[:,]", start)
+                start_sec = int(h) * 3600 + int(m) * 60 + int(s)
+                times.append(start_sec)
+            elif re.match(r"^(chapter|prologue|epilogue|\d+|[IVXLC]+)\b", line.strip(), re.IGNORECASE):
+                keywords.append(len(times))
+
+        if keywords:
+            # Convert keyword positions to chapters
+            for i, idx in enumerate(keywords):
+                start = times[idx]
+                end = times[keywords[i + 1]] if i + 1 < len(keywords) else None
+                chapters.append((start, end))
+        else:
+            # Use gaps
+            last = 0
+            for current in times:
+                if current - last >= 60:
+                    chapters.append((last, current))
+                    last = current
+            chapters.append((last, None))
+    except Exception as e:
+        logging.warning(f"Chapter parsing from SRT failed: {e}")
+    return chapters
+
+def openlibrary_request(url: str) -> dict:
+    for attempt in range(10):
+        try:
+            with urllib.request.urlopen(url) as response:
+                return json.loads(response.read().decode())
+        except Exception as e:
+            logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
+            time.sleep(20)
+    raise RuntimeError(f"Failed to fetch OpenLibrary data after 10 attempts: {url}")
+
+def get_expected_chapter_count(title: str) -> int | None:
+    """
+    Uses OpenLibrary to estimate the expected number of chapters for a given title.
+    Returns number of ToC entries if available, otherwise None.
+    """
+    import urllib.request
+    import urllib.parse
+    import json
+
+    q = urllib.parse.quote(title)
+    search_url = f"https://openlibrary.org/search.json?title={q}&has_fulltext=true&language=eng"
+
+    try:
+        with urllib.request.urlopen(search_url) as response:
+            search_data = json.loads(response.read().decode())
+            if not search_data.get("docs"):
+                return None
+
+            work_key = search_data["docs"][0].get("key")
+            if not work_key:
+                return None
+
+        toc_url = f"https://openlibrary.org{work_key}.json"
+        with urllib.request.urlopen(toc_url) as toc_response:
+            toc_data = json.loads(toc_response.read().decode())
+            toc = toc_data.get("table_of_contents")
+            if isinstance(toc, list):
+                return len(toc)
+
+    except Exception as e:
+        logging.warning(f"OpenLibrary chapter lookup failed: {e}")
+        return None
+
+def openlibrary_request(url: str) -> dict:
+    for attempt in range(10):
+        try:
+            with urllib.request.urlopen(url) as response:
+                return json.loads(response.read().decode())
+        except Exception as e:
+            logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
+            time.sleep(20)
+    raise RuntimeError(f"Failed to fetch OpenLibrary data after 10 attempts: {url}")
+
+def fetch_openlibrary_metadata(title: str) -> dict:
+    """
+    Fetch book metadata (title, author, series, cover URL) using OpenLibrary API.
+    """
+    q = urllib.parse.quote(title)
+    search_url = f"https://openlibrary.org/search.json?title={q}&has_fulltext=true&language=eng"
+    data = openlibrary_request(search_url)
+
+    if not data.get("docs"):
+        return {}
+
+    doc = data["docs"][0]
+    result = {
+        "title": doc.get("title"),
+        "author": doc.get("author_name", ["Unknown"])[0],
+        "series": doc.get("series", [None])[0],
+        "cover_url": f"https://covers.openlibrary.org/b/id/{doc['cover_i']}-L.jpg" if "cover_i" in doc else None
+    }
+    return result
+
+def build_audiobook_filename(metadata: dict) -> str:
+    """
+    Constructs a filename like:
+    'Series Name Book 2, Title - Author.m4b'
+    """
+    series = metadata.get("series_name", "").strip()
+    number = metadata.get("series_number", "").strip()
+    title = metadata.get("title", "").strip()
+    author = metadata.get("author", "").strip()
+
+    parts = []
+    if series and number:
+        parts.append(f"{series} Book {number}")
+    if title:
+        parts.append(title)
+    if author:
+        parts.append(f"- {author}")
+
+    if not parts:
+        return "Unknown_Audiobook.m4b"
+
+    return ", ".join(parts[:-1]) + f" {parts[-1]}.m4b"
+
+
+import logging
+from pathlib import Path
+
+import logging
+from pathlib import Path
+
+def get_output_path_for_media(media_type: str, metadata: dict, base_output_dir: Path, dry_run: bool = False) -> Path | None:
+    """
+    Returns and (optionally) creates the output directory path based on media type.
+    Logs the resolved path and respects dry run. If media_type is unsupported, logs and returns None.
+    """
+    media_type = media_type.lower()
+
+    if media_type == "movie":
+        dest_dir = base_output_dir / "Movies"
+
+    elif media_type == "audiobook":
+        dest_dir = base_output_dir / "Audiobooks"
+
+    elif media_type == "show":
+        show_title = metadata.get("show_title", "Unknown Show").strip()
+        season_number = metadata.get("season_number", 1)
+        season_str = f"Season {int(season_number):02d}"
+        dest_dir = base_output_dir / "Shows" / show_title / season_str
+
+    else:
+        logging.warning(f"⚠️ Unsupported media type '{media_type}'. Skipping.")
+        return None
+
+    if dry_run:
+        logging.info(f"[DRY RUN] Would use/create output directory: {dest_dir}")
+    else:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"📁 Created or confirmed output directory: {dest_dir}")
+
+    return dest_dir
+
+def is_safe_to_trash(path: Path) -> bool:
+    try:
+        path = path.resolve()
+        system = platform.system()
+
+        # Always block these + their children
+        protected_paths = {
+            Path("/"), Path.home(),
+
+            # Linux/macOS system paths
+            Path("/usr"), Path("/etc"), Path("/bin"),
+            Path("/sbin"), Path("/lib"), Path("/var"),
+
+            # Windows system paths
+            Path("C:/Windows"), Path("C:/Program Files"),
+            Path("C:/Program Files (x86)"),
+            Path("C:/Users") if system == "Windows" else None
+        }
+
+        protected_paths = {p.resolve() for p in protected_paths if p}
+
+        for protected in protected_paths:
+            if path == protected or protected in path.parents:
+                logging.warning(f"🚫 Refusing to trash protected path or child: {path}")
+                return False
+
+        return True
+
+    except Exception as e:
+        logging.warning(f"⚠️ Could not verify safety for {path}: {e}")
         return False

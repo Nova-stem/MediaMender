@@ -18,7 +18,7 @@ from src.preferences import get_log_path, _load_config
 from src.dialog import ThemedMessage
 from src.processing.media_processor import detect_media_type
 from src.drag_drop_table import DragDropSortableTable, NoFocusDelegate
-from src.processing.common_utils import ensure_whisper_model_installed
+from src.processing.common_utils import ensure_whisper_model_installed, install_ffmpeg_if_needed
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 
@@ -217,10 +217,15 @@ class MediaMender(QMainWindow):
             dialog.exec()
             return
         model = get_whisper_model()
-        if not ensure_whisper_model_installed(model, self.update_progress):
+        if not ensure_whisper_model_installed(model, self.update_progress, dry_run=self.dry_run):
             dialog = ThemedMessage("Model Error", "Whisper model installation failed. Cannot continue.", self)
             dialog.exec()
             return
+        if not install_ffmpeg_if_needed(self.update_progress, dry_run=self.dry_run):
+            dialog = ThemedMessage("Missing FFmpeg", "FFmpeg could not be installed. Processing cannot continue.", self)
+            dialog.exec()
+            return
+
         self.lock_table()
 
         self.update_file_order()

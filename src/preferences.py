@@ -7,6 +7,15 @@ from PySide6.QtWidgets import (
 )
 from src.theme_manager import ThemeMode
 from src.dialog import ThemedMessage
+from src.system.gpu_utils import (
+    is_nvidia_gpu_present,
+    is_cuda_runtime_available,
+    is_torch_cuda_available,
+    install_cuda_enabled_torch,
+    get_cuda_installer_url,
+    download_cuda_installer,
+    run_cuda_installer
+)
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 
@@ -26,7 +35,6 @@ class PreferencesWindow(QDialog):
         self.trash_field = self.create_path_field("Trash Folder", self.config.get("trash_dir", ""))
         self.tmdb_api_field = self.create_path_field("TMDb API Key", self.config.get("tmdb_api_key", ""))
         self.log_path_field = self.create_path_field("Log Folder", self.config.get("log_dir", "logs"))
-
 
         layout.addLayout(self.input_field["layout"])
         layout.addLayout(self.output_field["layout"])
@@ -61,20 +69,31 @@ class PreferencesWindow(QDialog):
         #self.prohibit_extraction = QCheckBox("Prohibit Extraction")
         #self.prohibit_downloads = QCheckBox("Prohibit Downloads")
         #self.prohibit_encoding = QCheckBox("Prohibit Encoding")
-        self.allow_generation = QCheckBox("Allow Generation")
+        self.allow_generation = QCheckBox("Enable Whisper (Subtitle Generation)")
         self.dry_run_checkbox = QCheckBox("Enable Dry Run (no file changes)")
+        self.gpu_checkbox = QCheckBox("Enable GPU Acceleration (NVIDIA only)")
 
         #self.prohibit_extraction.setChecked(self.config.get("prohibit_extraction", False))
         #self.prohibit_downloads.setChecked(self.config.get("prohibit_downloads", False))
         #self.prohibit_encoding.setChecked(self.config.get("prohibit_encoding", False))
         self.allow_generation.setChecked(self.config.get("allow_generation", True))
         self.dry_run_checkbox.setChecked(self.config.get("dry_run", False))
+        self.gpu_checkbox.setChecked(self.config.get("gpu_enabled", False))
+
 
         #layout.addWidget(self.prohibit_extraction)
         #layout.addWidget(self.prohibit_downloads)
         #layout.addWidget(self.prohibit_encoding)
         layout.addWidget(self.allow_generation)
         layout.addWidget(self.dry_run_checkbox)
+
+        if not is_nvidia_gpu_present():
+            self.gpu_checkbox.setEnabled(False)
+            self.gpu_checkbox.setToolTip("No NVIDIA GPU detected on this system.")
+        else:
+            self.gpu_checkbox.setToolTip("Uses CUDA for Whisper transcription if supported.")
+
+        layout.addWidget(self.gpu_checkbox)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -124,6 +143,7 @@ class PreferencesWindow(QDialog):
         #self.config["prohibit_encoding"] = self.prohibit_encoding.isChecked()
         self.config["allow_generation"] = self.allow_generation.isChecked()
         self.config["dry_run"] = self.dry_run_checkbox.isChecked()
+        self.config["gpu_enabled"] = self.gpu_checkbox.isChecked()
         self.config["theme"] = self.theme_combo.currentText().lower()
 
         os.makedirs(CONFIG_PATH.parent, exist_ok=True)
@@ -134,6 +154,8 @@ class PreferencesWindow(QDialog):
         dialog.setPalette(self.palette())  # Apply current theme
         dialog.setStyle(self.style())  # Ensure style inheritance
         dialog.exec()
+
+        after_preferences_saved(self.config, dry_run=self.config.get("dry_run", False))
 
         if self.on_theme_changed:
             self.on_theme_changed()
@@ -186,3 +208,77 @@ def get_whisper_model() -> str:
 def is_generation_allowed() -> bool:
     config = _load_config()
     return config.get("allow_generation", False)
+
+
+def after_preferences_saved(config, dry_run=False):
+    if not config.get("gpu_enabled", False):
+        return
+
+    if not is_nvidia_gpu_present():
+        ThemedMessage.critical(
+            None,
+            "No NVIDIA GPU",
+            "GPU acceleration was enabled but no NVIDIA GPU was found.\n\n"
+            "GPU acceleration has been disabled."
+        )
+        config["gpu_enabled"] = False
+        _write_config(config)
+        return
+
+    if is_cuda_runtime_available() and is_torch_cuda_available():
+        return
+
+    result = ThemedMessage.question(
+        None,
+        "Install CUDA Toolkit",
+        "CUDA support is missing. This requires both the CUDA Toolkit and a GPU-enabled PyTorch install.\n\n"
+        "Would you like to automatically install the required components?",
+        buttons=["Install", "Disable"]
+    )
+
+    if result == "Install":
+        installer_url = get_cuda_installer_url()
+        installer_path = Path.cwd() / "cuda_installer.exe"
+
+        if not download_cuda_installer(installer_url, installer_path, dry_run=dry_run):
+            ThemedMessage.critical(
+                None,
+                "Download Failed",
+                "Failed to download the CUDA Toolkit installer. GPU acceleration has been disabled."
+            )
+            config["gpu_enabled"] = False
+            _write_config(config)
+            return
+
+        if not run_cuda_installer(installer_path, dry_run=dry_run):
+            ThemedMessage.critical(
+                None,
+                "Install Failed",
+                "CUDA Toolkit installation could not be started. GPU acceleration has been disabled."
+            )
+            config["gpu_enabled"] = False
+            _write_config(config)
+            return
+
+        if not install_cuda_enabled_torch():
+            ThemedMessage.critical(
+                None,
+                "PyTorch GPU Install Failed",
+                "Failed to install PyTorch with CUDA support. GPU acceleration has been disabled."
+            )
+            config["gpu_enabled"] = False
+            _write_config(config)
+            return
+
+        if not (is_cuda_runtime_available() and is_torch_cuda_available()):
+            ThemedMessage.critical(
+                None,
+                "CUDA Still Missing",
+                "CUDA runtime or PyTorch with GPU support is still not available after installation.\n\n"
+                "GPU acceleration has been disabled."
+            )
+            config["gpu_enabled"] = False
+            _write_config(config)
+    else:
+        config["gpu_enabled"] = False
+        _write_config(config)
