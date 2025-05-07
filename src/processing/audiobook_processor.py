@@ -16,7 +16,7 @@ from src.processing.common_utils import (
 
 
 def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = False):
-    logging.info(f"📘 [Audiobook] Starting: {file_path.name}")
+    logging.info(f"[Audiobook] Starting: {file_path.name}")
     output_dir = get_output_path_for_media("audiobook", {}, base_output_dir)
 
     config = _load_config()
@@ -44,7 +44,7 @@ def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = Fa
     logging.info(f"🎧 Output filename: {m4b_path.name}")
 
     if m4b_path.exists():
-        logging.info(f"⏩ Skipping audiobook (already exists): {m4b_path.name}")
+        logging.info(f"Skipping audiobook (already exists): {m4b_path.name}")
         return
 
     if cover_url and not dry_run:
@@ -52,7 +52,7 @@ def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = Fa
             cover_path = output_dir / "cover.jpg"
             urllib.request.urlretrieve(cover_url, cover_path)
         except Exception as e:
-            logging.warning(f"⚠️ Failed to download cover image: {e}")
+            logging.warning(f"Failed to download cover image: {e}")
             cover_path = None
 
     # Step 1: Detect single vs multi-part
@@ -60,7 +60,7 @@ def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = Fa
     if file_path.is_dir():
         parts = sorted(file_path.glob("*.mp3")) + sorted(file_path.glob("*.m4a"))
         if not parts:
-            logging.warning(f"❌ No audio parts found in {file_path}")
+            logging.warning(f"No audio parts found in {file_path}")
             return
     else:
         parts = [file_path]

@@ -1,54 +1,42 @@
 # src/processing/common_utils.py
-import json
-import re
-import platform
-import os
-import shutil
-import subprocess
-from pathlib import Path
-from typing import Optional, Any
-import string
-from spellchecker import SpellChecker
-from tmdbv3api import TMDb, Movie, TV, Search
-from src.preferences import get_tmdb_api_key, is_generation_allowed, get_whisper_model
-import logging
-import difflib
-#import whisper
-from faster_whisper import WhisperModel
-from srt import Subtitle, compose
+
+#Standard
 import datetime
-from datetime import time
+import difflib
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import string
+import subprocess
 import zipfile
-import urllib.request
+from datetime import time
+from pathlib import Path
+from typing import Any, Optional
+from urllib import parse, request
+
+#Third Party
+from faster_whisper import WhisperModel
+from spellchecker import SpellChecker
+from srt import Subtitle, compose
+from tmdbv3api import Movie, Search, TMDb, TV
+
+#Local
+from src.dialog import ThemedMessage
+from src.preferences import get_tmdb_api_key, get_whisper_model, is_generation_allowed
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_TARGET = Path("resources/ffmpeg/ffmpeg.exe")
 _ignored_names_cache = None
-
-def load_ignored_names() -> set[str]:
-    global _ignored_names_cache
-    if _ignored_names_cache is not None:
-        return _ignored_names_cache
-
-    path = Path(__file__).parent.parent / "resources" / "ignored_names.txt"
-    if not path.exists():
-        _ignored_names_cache = set()
-        return _ignored_names_cache
-
-    with open(path, "r", encoding="utf-8") as f:
-        _ignored_names_cache = set(line.strip().lower() for line in f if line.strip())
-    return _ignored_names_cache
-
-ignored_names = load_ignored_names()
 spellchecker = SpellChecker(distance=1)
-
-
 tmdb = TMDb()
 tmdb.api_key = get_tmdb_api_key() or ""
 tmdb.language = 'en'
 movie_search = Movie()
 tv_search = TV()
-
+_tmdb_warning_shown = False
 
 BRANDING_PATTERNS = [
     ["sync", "by"], ["addic7ed"], ["subscene"], ["corrected", "by"],
@@ -65,6 +53,21 @@ BRANDING_PATTERNS = [
     ["©"], ["subtitle", "by"], ["explosiveskull"], [".app"],
     [".admit"], ["subtitled", "by"], ["muntasir"], [".co"]
 ]
+
+def load_ignored_names() -> set[str]:
+    global _ignored_names_cache
+    if _ignored_names_cache is not None:
+        return _ignored_names_cache
+
+    path = Path(__file__).parent.parent / "resources" / "ignored_names.txt"
+    if not path.exists():
+        _ignored_names_cache = set()
+        return _ignored_names_cache
+
+    with open(path, "r", encoding="utf-8") as f:
+        _ignored_names_cache = set(line.strip().lower() for line in f if line.strip())
+    return _ignored_names_cache
+ignored_names = load_ignored_names()
 
 def detect_aspect_ratio(file_path: Path) -> str:
     """Detects aspect ratio using ffprobe and returns label."""
@@ -91,7 +94,6 @@ def detect_aspect_ratio(file_path: Path) -> str:
         print(f"Aspect ratio detection failed: {e}")
         return "Widescreen"
 
-
 def detect_source_format(file_name: str) -> str:
     """Returns 'DVD', 'Bluray', or 'Temp' based on file name."""
     name = file_name.lower()
@@ -101,7 +103,6 @@ def detect_source_format(file_name: str) -> str:
         return "Bluray"
     else:
         return "Temp"
-
 
 def clean_subtitle_text(text: str) -> str:
     def is_branding_line(line: str) -> bool:
@@ -115,11 +116,9 @@ def clean_subtitle_text(text: str) -> str:
     cleaned = [line for line in lines if not is_branding_line(line)]
     return "\n".join(cleaned)
 
-
 def sanitize_filename(name: str) -> str:
     """Removes illegal filename characters."""
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
-
 
 def extract_year_from_metadata(metadata: dict) -> Optional[int]:
     """Returns the year from metadata, if available."""
@@ -234,9 +233,21 @@ def extract_metadata_from_filename(file_path: str) -> dict:
 
     return metadata
 
+def set_tmdb_warning_callback(callback: callable):
+    global _tmdb_warning_callback
+    _tmdb_warning_callback = callback
 
 def validate_with_tmdb(metadata: dict, media_type: str = "movie") -> dict:
     """Validate and enrich metadata using TMDb."""
+    global _tmdb_warning_shown
+
+    api_key = get_tmdb_api_key()
+    if not api_key:
+        if not _tmdb_warning_shown:
+            logging.warning("TMDb API key is missing. Metadata lookup skipped.")
+            _tmdb_warning_shown = True
+        return metadata
+
     query = metadata["title"]
     year = metadata.get("year")
 
@@ -264,15 +275,9 @@ def validate_with_tmdb(metadata: dict, media_type: str = "movie") -> dict:
 
     return metadata  # fallback to original if nothing found
 
-def prepare_subtitles_for_muxing(
-    video_path: Path,
-    trash_dir: Path,
-    dry_run: bool
-) -> list[dict]:
+def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: bool) -> list[dict]:
     subtitle_tracks = find_all_subtitles(video_path)
     prepared = []
-
-    whisper_model = get_whisper_model()
 
     for track in subtitle_tracks:
         original = track["path"]
@@ -291,7 +296,7 @@ def prepare_subtitles_for_muxing(
                     sub_path = converted
                     move_to_trash(original, trash_dir, dry_run)
             except Exception as e:
-                logging.warning(f"⚠️ Subtitle conversion failed: {e}")
+                logging.warning(f"Subtitle conversion failed: {e}")
                 continue
 
         # Clean + correct
@@ -313,22 +318,23 @@ def prepare_subtitles_for_muxing(
                                 f"Line {entry['line']}, Word {entry['word']}: "
                                 f"{entry['original']} → {entry['corrected']}\n"
                             )
-                    logging.info(f"✏️ Logged {len(corrections)} subtitle corrections to: {log_path.name}")
+                    logging.info(f"Logged {len(corrections)} subtitle corrections to: {log_path.name}")
 
             prepared.append({
                 "path": cleaned_path,
-                "type": sub_type
+                "type": sub_type,
+                "original_path": sub_path
             })
 
         except Exception as e:
-            logging.warning(f"⚠️ Subtitle cleanup failed for {original.name}: {e}")
+            logging.warning(f"Subtitle cleanup failed for {original.name}: {e}")
 
     # Fallback generation if no usable subtitles found
     if not prepared:
-        logging.info("🔍 No usable subtitles found.")
+        logging.info("No usable subtitles found.")
 
         if is_generation_allowed():
-            logging.info("🧠 Generating subtitles from audio...")
+            logging.info("Generating subtitles from audio...")
             normal_srt = video_path.with_name(video_path.stem + ".normal.srt")
             if generate_normal_subtitles_from_audio(video_path, normal_srt, dry_run):
                 prepared.append({"path": normal_srt, "type": "normal"})
@@ -337,7 +343,7 @@ def prepare_subtitles_for_muxing(
             if generate_forced_subtitles_from_audio(video_path, forced_srt, dry_run):
                 prepared.append({"path": forced_srt, "type": "forced"})
         else:
-            logging.info("⚠️ Subtitle generation is disabled. Enable 'Allow Generation' in preferences to use Whisper.")
+            logging.info("Subtitle generation is disabled. Enable 'Allow Generation' in preferences to use Whisper.")
 
     return prepared
 
@@ -395,8 +401,13 @@ def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool):
     """
     if not file_path.exists():
         return
+
+    if dry_run and not is_safe_to_trash(file_path):
+        logging.warning(f"[DRY RUN] Refusing to trash file outside of safe zones: {file_path}")
+        return
+
     if not is_safe_to_trash(file_path):
-        logging.warning(f"❌ Skipped trashing unsafe file: {file_path}")
+        logging.warning(f"Refusing to trash file outside of safe zones: {file_path}")
         return
 
     trash_dir.mkdir(parents=True, exist_ok=True)
@@ -409,16 +420,14 @@ def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool):
         counter += 1
 
     if dry_run:
-        logging.info(f"[DRY RUN] Would move to trash: {file_path} → {dest}")
+        logging.info(f"[DRY RUN] Moved to trash: {file_path.name} → {dest.name}")
         return
 
     file_path.rename(dest)
-    logging.info(f"🗑️ Moved to trash: {file_path.name} → {dest.name}")
+    logging.info(f"Moved to trash: {file_path.name} → {dest.name}")
 
 def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
-    from src.preferences import get_whisper_model
-
-    logging.info(f"🧠 Scanning for non-English (forced) segments in: {file_path.name}")
+    logging.info(f"Scanning for non-English (forced) segments in: {file_path.name}")
     if dry_run:
         logging.info(f"[DRY RUN] Would write forced subtitles to: {output_srt}")
         return True
@@ -439,21 +448,19 @@ def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_
                 forced_segments.append(Subtitle(index=i+1, start=start, end=end, content=text))
 
         if not forced_segments:
-            logging.info("🔇 No non-English speech found.")
+            logging.info("No non-English speech found.")
             return False
 
         output_srt.write_text(compose(forced_segments), encoding="utf-8")
-        logging.info(f"📝 Forced subtitles saved: {output_srt.name}")
+        logging.info(f"Forced subtitles saved: {output_srt.name}")
         return True
 
     except Exception as e:
-        logging.warning(f"❌ Whisper (forced) generation failed: {e}")
+        logging.warning(f"Whisper (forced) generation failed: {e}")
         return False
 
 def generate_normal_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
-    from src.preferences import get_whisper_model
-
-    logging.info(f"🧠 Generating full transcription subtitles for: {file_path.name}")
+    logging.info(f"Generating full transcription subtitles for: {file_path.name}")
     if dry_run:
         logging.info(f"[DRY RUN] Would write normal subtitles to: {output_srt}")
         return True
@@ -472,15 +479,15 @@ def generate_normal_subtitles_from_audio(file_path: Path, output_srt: Path, dry_
             srt_segments.append(Subtitle(index=i+1, start=start, end=end, content=text))
 
         if not srt_segments:
-            logging.warning("⚠️ No segments generated.")
+            logging.warning("No segments generated.")
             return False
 
         output_srt.write_text(compose(srt_segments), encoding="utf-8")
-        logging.info(f"📝 Normal subtitles saved: {output_srt.name}")
+        logging.info(f"Normal subtitles saved: {output_srt.name}")
         return True
 
     except Exception as e:
-        logging.warning(f"❌ Whisper (normal) generation failed: {e}")
+        logging.warning(f"Whisper (normal) generation failed: {e}")
         return False
 
 def get_whisper_model_dir() -> Path:
@@ -492,7 +499,7 @@ def get_whisper_model_dir() -> Path:
 def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: bool = False) -> bool:
     model_dir = get_whisper_model_dir() / model
     if model_dir.exists() and any(model_dir.iterdir()):
-        logging.info(f"✅ Whisper model '{model}' already installed.")
+        logging.info(f"Whisper model '{model}' already installed.")
         return True
 
     if dry_run:
@@ -502,7 +509,7 @@ def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: 
         return True
 
     try:
-        logging.info(f"🔽 Downloading Whisper model: {model} to {model_dir}")
+        logging.info(f"Downloading Whisper model: {model} to {model_dir}")
         if progress_callback:
             progress_callback(0, f"Downloading Whisper model '{model}'...")
 
@@ -514,7 +521,7 @@ def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: 
         return True
 
     except Exception as e:
-        logging.error(f"❌ Failed to download Whisper model '{model}': {e}")
+        logging.error(f"Failed to download Whisper model '{model}': {e}")
         if progress_callback:
             progress_callback(0, f"Failed to install Whisper model: {e}")
         return False
@@ -534,14 +541,14 @@ def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False) -> s
     # 1. Check system PATH
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        logging.info("✅ FFmpeg found in system PATH.")
+        logging.info("FFmpeg found in system PATH.")
         return "ffmpeg"
     except Exception:
         pass
 
     # 2. Check local install
     if FFMPEG_TARGET.exists():
-        logging.info("✅ FFmpeg found in local resources.")
+        logging.info("FFmpeg found in local resources.")
         return str(FFMPEG_TARGET)
 
     if dry_run:
@@ -556,7 +563,7 @@ def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False) -> s
             progress_callback(0, "Downloading FFmpeg...")
 
         zip_path = Path("ffmpeg_tmp.zip")
-        urllib.request.urlretrieve(FFMPEG_URL, zip_path)
+        request.urlretrieve(FFMPEG_URL, zip_path)
 
         if progress_callback:
             progress_callback(30, "Extracting FFmpeg...")
@@ -577,7 +584,7 @@ def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False) -> s
         return str(FFMPEG_TARGET)
 
     except Exception as e:
-        logging.error(f"❌ Failed to install FFmpeg: {e}")
+        logging.error(f"Failed to install FFmpeg: {e}")
         if progress_callback:
             progress_callback(0, "Failed to install FFmpeg.")
         return None
@@ -624,7 +631,7 @@ def parse_chapters_from_srt(srt_path: Path) -> list[tuple[float, float]]:
 def openlibrary_request(url: str) -> dict:
     for attempt in range(10):
         try:
-            with urllib.request.urlopen(url) as response:
+            with request.urlopen(url) as response:
                 return json.loads(response.read().decode())
         except Exception as e:
             logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
@@ -636,15 +643,11 @@ def get_expected_chapter_count(title: str) -> int | None:
     Uses OpenLibrary to estimate the expected number of chapters for a given title.
     Returns number of ToC entries if available, otherwise None.
     """
-    import urllib.request
-    import urllib.parse
-    import json
-
-    q = urllib.parse.quote(title)
+    q = parse.quote(title)
     search_url = f"https://openlibrary.org/search.json?title={q}&has_fulltext=true&language=eng"
 
     try:
-        with urllib.request.urlopen(search_url) as response:
+        with request.urlopen(search_url) as response:
             search_data = json.loads(response.read().decode())
             if not search_data.get("docs"):
                 return None
@@ -654,7 +657,7 @@ def get_expected_chapter_count(title: str) -> int | None:
                 return None
 
         toc_url = f"https://openlibrary.org{work_key}.json"
-        with urllib.request.urlopen(toc_url) as toc_response:
+        with request.urlopen(toc_url) as toc_response:
             toc_data = json.loads(toc_response.read().decode())
             toc = toc_data.get("table_of_contents")
             if isinstance(toc, list):
@@ -667,7 +670,7 @@ def get_expected_chapter_count(title: str) -> int | None:
 def openlibrary_request(url: str) -> dict:
     for attempt in range(10):
         try:
-            with urllib.request.urlopen(url) as response:
+            with request.urlopen(url) as response:
                 return json.loads(response.read().decode())
         except Exception as e:
             logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
@@ -678,7 +681,7 @@ def fetch_openlibrary_metadata(title: str) -> dict:
     """
     Fetch book metadata (title, author, series, cover URL) using OpenLibrary API.
     """
-    q = urllib.parse.quote(title)
+    q = parse.quote(title)
     search_url = f"https://openlibrary.org/search.json?title={q}&has_fulltext=true&language=eng"
     data = openlibrary_request(search_url)
 
@@ -717,13 +720,6 @@ def build_audiobook_filename(metadata: dict) -> str:
 
     return ", ".join(parts[:-1]) + f" {parts[-1]}.m4b"
 
-
-import logging
-from pathlib import Path
-
-import logging
-from pathlib import Path
-
 def get_output_path_for_media(media_type: str, metadata: dict, base_output_dir: Path, dry_run: bool = False) -> Path | None:
     """
     Returns and (optionally) creates the output directory path based on media type.
@@ -744,45 +740,54 @@ def get_output_path_for_media(media_type: str, metadata: dict, base_output_dir: 
         dest_dir = base_output_dir / "Shows" / show_title / season_str
 
     else:
-        logging.warning(f"⚠️ Unsupported media type '{media_type}'. Skipping.")
+        logging.warning(f"Unsupported media type '{media_type}'. Skipping.")
         return None
 
     if dry_run:
         logging.info(f"[DRY RUN] Would use/create output directory: {dest_dir}")
     else:
         dest_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"📁 Created or confirmed output directory: {dest_dir}")
+        logging.info(f"Created or confirmed output directory: {dest_dir}")
 
     return dest_dir
 
 def is_safe_to_trash(path: Path) -> bool:
     try:
         path = path.resolve()
-        system = platform.system()
+        system_drive = Path(path.anchor).resolve()  # e.g., "C:\", "/"
 
-        # Always block these + their children
-        protected_paths = {
-            Path("/"), Path.home(),
+        # 1. Block root of OS
+        if path == system_drive:
+            logging.warning(f"Refusing to trash system root: {path}")
+            return False
 
-            # Linux/macOS system paths
-            Path("/usr"), Path("/etc"), Path("/bin"),
-            Path("/sbin"), Path("/lib"), Path("/var"),
+        # 2. Define allowed base folders (Windows known user folders)
+        user_home = Path.home()
+        safe_folders = [
+            user_home / "Documents",
+            user_home / "Desktop",
+            user_home / "Downloads",
+            user_home / "Pictures",
+            user_home / "Music",
+            user_home / "Videos"
+        ]
+        safe_folders = [p.resolve() for p in safe_folders if p.exists()]
 
-            # Windows system paths
-            Path("C:/Windows"), Path("C:/Program Files"),
-            Path("C:/Program Files (x86)"),
-            Path("C:/Users") if system == "Windows" else None
-        }
+        # 3. Allow if in any of the safe user folders
+        for safe in safe_folders:
+            if safe in path.parents:
+                logging.debug(f"Safe: {safe}")
+                return True
 
-        protected_paths = {p.resolve() for p in protected_paths if p}
+        # 4. Allow if file is within a folder whose name includes "MediaMender"
+        for parent in path.parents:
+            logging.debug(f"Parent: {parent}")
+            if "mediamender" in parent.name.lower():
+                return True
 
-        for protected in protected_paths:
-            if path == protected or protected in path.parents:
-                logging.warning(f"🚫 Refusing to trash protected path or child: {path}")
-                return False
-
-        return True
+        logging.warning(f"Refusing to trash file outside of safe zones: {path}")
+        return False
 
     except Exception as e:
-        logging.warning(f"⚠️ Could not verify safety for {path}: {e}")
+        logging.warning(f"Could not verify safety for {path}: {e}")
         return False

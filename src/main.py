@@ -1,38 +1,36 @@
 # src/main.py
 
-import sys, os, json
-from PySide6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QVBoxLayout, QPushButton, QWidget, QProgressBar, QLabel, QComboBox, QAbstractItemView, QHeaderView
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QPalette, QIcon, QStandardItem
-from src.theme_manager import apply_theme
-#from src.theme import apply_system_theme
-from src.style import get_base_stylesheet
-from preferences import PreferencesWindow, load_theme
-from src.processing.media_processor import process_media
-#import configparser
-from src.preferences import load_column_widths, save_column_widths, get_whisper_model
-from pathlib import Path
+# --- Standard Library ---
+import json
 import logging
+import os
+import sys
+import threading
 from datetime import datetime
-from src.preferences import get_log_path, _load_config
+from pathlib import Path
+
+# --- Third-Party ---
+from PySide6.QtCore import QThread, Signal, Qt, QSize
+from PySide6.QtGui import QIcon, QPalette, QStandardItem, QColor
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QHeaderView, QMainWindow, QHBoxLayout, QPushButton, \
+    QProgressBar, QLabel, QWidget, QVBoxLayout, QToolTip
+
+# --- Local ---
+from preferences import load_theme, PreferencesWindow
+from src.processing.common_utils import set_tmdb_warning_callback
 from src.dialog import ThemedMessage
-from src.processing.media_processor import detect_media_type
-from src.drag_drop_table import DragDropSortableTable, NoFocusDelegate
+from src.drag_drop_table import NoFocusDelegate, DragDropSortableTable
+from src.preferences import _load_config, get_log_path, get_whisper_model, load_column_widths, save_column_widths
 from src.processing.common_utils import ensure_whisper_model_installed, install_ffmpeg_if_needed
+from src.processing.media_processor import detect_media_type, process_media
+from src.style import get_base_stylesheet
+from src.theme_manager import apply_theme
+from src.logging_utils import configure_logger, CURRENT_LOG_FILE
 
+gui_lock = threading.Lock()
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
-
-log_path = get_log_path()
-timestamp = datetime.now().strftime("%Y%m%d.%H%M")
-log_filename = log_path / f"media_mender_{timestamp}.log"
-CURRENT_LOG_FILE = log_filename
-
-logging.basicConfig(
-    filename=log_filename,
-    filemode="w",  # use "w" to start a fresh file each run
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+log_dir = get_log_path()
+configure_logger(log_dir)
 
 class WorkerThread(QThread):
     update_progress = Signal(int, str)
@@ -56,13 +54,9 @@ class WorkerThread(QThread):
             self.update_progress.emit(int((i + 1) / len(self.files) * 100), filename)
 
             try:
-                if self.dry_run:
-                    logging.info(f"[DRY RUN] Would process: {filename}")
-                    success = True
-                else:
-                    process_media(Path(file), self.output_dir)
-                    logging.info(f"Processed file: {filename}")
-                    success = True
+                process_media(Path(file), self.output_dir, self.trash_dir, self.dry_run)
+                logging.info(f"{'[DRY RUN] ' if self.dry_run else ''}Processed file: {filename}")
+                success = True
             except Exception as e:
                 logging.exception(f"Error processing {filename}")
                 success = False
@@ -73,8 +67,9 @@ class WorkerThread(QThread):
         self.running = False
 
 class MediaMender(QMainWindow):
-    def __init__(self):
+    def __init__(self, app):
         super().__init__()
+        self.app = app
         self.setWindowTitle("MediaMender v0.1")
         self.setGeometry(100, 100, 800, 500)
         self.worker = None
@@ -85,25 +80,134 @@ class MediaMender(QMainWindow):
         self.setup_ui()
 
     def setup_ui(self):
-        menu = self.menuBar()
-        settings_menu = menu.addMenu("Settings")
-        preferences_action = QAction("Preferences", self)
-        preferences_action.triggered.connect(self.open_preferences)
-        settings_menu.addAction(preferences_action)
+        palette = self.palette()
+        bg_idle = palette.color(QPalette.Button).name()
+        bg_hover = palette.color(QPalette.Highlight).name()
+        fg_color = palette.color(QPalette.ButtonText).name()
+        text_color = palette.color(QPalette.ButtonText).name()
+
+        palette = app.palette()
+        tooltip_bg = palette.color(QPalette.ToolTipBase).name()
+        tooltip_fg = palette.color(QPalette.ToolTipText).name()
+        tooltip_border = palette.color(QPalette.Mid).name()  # subtle border
+        app.setStyleSheet(app.styleSheet() + f"""
+            QToolTip {{
+                background-color: {tooltip_bg};
+                color: {tooltip_fg};
+                border: 1px solid {tooltip_border};
+                padding: 5px;
+                border-radius: 4px;
+            }}
+        """)
+
+
+        self.preferences_button = QPushButton()
+        icon_path = Path(__file__).parent.parent / "resources" / "gear.png"
+        self.preferences_button.setIcon(QIcon(str(icon_path)))
+        self.preferences_button.setToolTip("Preferences")
+        self.preferences_button.setFixedSize(40, 40)
+        self.preferences_button.setIconSize(QSize(24, 24))
+        self.preferences_button.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {bg_idle};
+                        color: {text_color};
+                        border-radius: 6px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {bg_hover};
+                    }}
+                """)
+        self.preferences_button.clicked.connect(self.open_preferences)
+
+        self.play_button = QPushButton()
+        icon_path = Path(__file__).parent.parent / "resources" / "start.png"
+        self.play_button.setIcon(QIcon(str(icon_path)))
+        self.play_button.setToolTip("Start Processing")
+        self.play_button.setFixedSize(40, 40)
+        self.play_button.setIconSize(QSize(24, 24))
+        self.play_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg_idle};
+                color: {text_color};
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                background-color: {bg_hover};
+            }}
+        """)
+        self.play_button.clicked.connect(self.start_processing)
+
+        self.stop_button = QPushButton()
+        icon_path = Path(__file__).parent.parent / "resources" / "stop.png"
+        self.stop_button.setIcon(QIcon(str(icon_path)))
+        self.stop_button.setToolTip("Stop Processing")
+        self.stop_button.setFixedSize(40, 40)
+        self.stop_button.setIconSize(QSize(24, 24))
+        self.stop_button.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {bg_idle};
+                        color: {text_color};
+                        border-radius: 6px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {bg_hover};
+                    }}
+                """)
+        self.stop_button.clicked.connect(self.stop_processing)
+
+        self.load_button = QPushButton("Load")
+        self.load_button.setToolTip("Load Files")
+        self.load_button.setFixedSize(60, 40)
+        self.load_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg_idle};
+                color: {text_color};
+                border-radius: 6px;
+                font-size: 17px;
+            }}
+            QPushButton:hover {{
+                background-color: {bg_hover};
+            }}
+        """)
+        self.load_button.clicked.connect(self.load_files)
+
+        self.unload_button = QPushButton("Unload")
+        self.unload_button.setToolTip("Unload All Files")
+        self.unload_button.setFixedSize(80, 40)
+        self.unload_button.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {bg_idle};
+                        color: {text_color};
+                        border-radius: 6px;
+                        font-size: 17px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {bg_hover};
+                    }}
+                """)
+        self.unload_button.clicked.connect(self.unload_files)
+
+        self.progress = QProgressBar()
+        self.status_label = QLabel("Idle")
+
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(self.preferences_button)
+        top_bar.addWidget(self.play_button)
+        top_bar.addWidget(self.stop_button)
+        top_bar.addWidget(self.load_button)
+        top_bar.addWidget(self.unload_button)
+        top_bar.addStretch()
+        top_bar.addWidget(self.status_label)
 
         central = QWidget()
         central.setAcceptDrops(True)
         layout = QVBoxLayout()
 
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All", "Movie", "TV Show", "Audiobook"])
-        layout.addWidget(self.filter_combo)
-
         self.table = DragDropSortableTable()
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setItemDelegate(NoFocusDelegate())
 
-        border_color = self.palette().color(QPalette.Light).name()
+        border_color = palette.color(QPalette.Light).name()
 
         header = self.table.horizontalHeader()
         header.sectionClicked.connect(self.renumber_table)
@@ -123,8 +227,6 @@ class MediaMender(QMainWindow):
             """
         )
 
-
-
         # Left-align headers
         for i in range(self.table.model.columnCount()):
             header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -140,27 +242,41 @@ class MediaMender(QMainWindow):
         header.setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
 
+        layout.addLayout(top_bar)
         layout.addWidget(self.table)
-
-        btn_layout = QVBoxLayout()
-        self.load_btn = QPushButton("Load Files")
-        self.load_btn.clicked.connect(self.load_files)
-        self.start_btn = QPushButton("Start")
-        self.start_btn.clicked.connect(self.start_processing)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_processing)
-        btn_layout.addWidget(self.load_btn)
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.stop_btn)
-
-        self.progress = QProgressBar()
-        self.status_label = QLabel("Idle")
-        layout.addWidget(self.status_label)
         layout.addWidget(self.progress)
 
-        layout.addLayout(btn_layout)
         central.setLayout(layout)
         self.setCentralWidget(central)
+
+        self.table.row_remove_requested.connect(self.remove_file_at_row)
+        self.table.files_dropped.connect(self.add_files_from_drop)
+
+    def add_files_from_drop(self, data):
+        file_paths, target_row = data
+        existing_filenames = {Path(f).name.lower() for f in self.files}
+
+        for path in file_paths:
+            filename = Path(path).name
+            if filename.lower() in existing_filenames:
+                logging.info(f"Skipped duplicate file: {filename}")
+                ThemedMessage.critical(self, "Duplicate File", f"The file '{filename}' is already in the queue.")
+                continue
+
+            self.files.insert(target_row, path)
+            media_type = detect_media_type(Path(path))
+
+            row_items = [
+                QStandardItem(""),  # will be renumbered
+                QStandardItem(filename),
+                QStandardItem(media_type),
+                QStandardItem("Pending")
+            ]
+            self.table.model.insertRow(target_row, row_items)
+            target_row += 1
+            logging.info(f"File added via external drop: {filename}")
+
+        self.renumber_table()
 
     def open_preferences(self):
         pref = PreferencesWindow(self)
@@ -172,27 +288,68 @@ class MediaMender(QMainWindow):
         with open(CONFIG_PATH, "r") as f:
             return json.load(f)
 
+    def unload_files(self):
+        if not self.files:
+            return
+
+        response = ThemedMessage.question(self,"Unload All Files","Are you sure you want to remove all loaded files?",["Yes", "Cancel"] )
+
+        if response == "Yes":
+            self.files.clear()
+            self.table.model.removeRows(0, self.table.model.rowCount())
+            self.renumber_table()
+            logging.info("All files have been unloaded.")
+
     def load_files(self):
         config = _load_config()
         input_dir = Path(config.get("input_dir", ""))
         if not input_dir.exists():
             dialog = ThemedMessage("Invalid Directory", "The input directory does not exist.", self)
-            dialog.setPalette(self.palette())  # Apply current theme
-            dialog.setStyle(self.style())  # Ensure style inheritance
+            dialog.setPalette(self.palette())
+            dialog.setStyle(self.style())
             dialog.exec()
             return
 
-        self.files = [
-            str(f) for f in input_dir.glob("*") if f.is_file()
-        ]
+        # List and sort files
+        all_files = [f for f in input_dir.glob("*") if f.is_file()]
+        all_files.sort(key=lambda f: f.name.lower())
 
-        self.files.sort(key=lambda path: Path(path).name.lower())  # Case-insensitive sort by filename
+        seen_filenames = set()
+        unique_files = []
+        duplicate_count = 0
 
+        for f in all_files:
+            name = f.name.lower()
+            if name in seen_filenames:
+                duplicate_count += 1
+                continue
+            seen_filenames.add(name)
+            unique_files.append(str(f))
+
+        self.files = unique_files
+
+        # Reset table and load only unique files
         self.table.model.removeRows(0, self.table.model.rowCount())
         for file_path in self.files:
             file_name = Path(file_path).name
             media_type = detect_media_type(Path(file_path))
             self.table.add_row([file_name, media_type, "Pending"])
+
+        self.renumber_table()
+
+        if duplicate_count > 0:
+            ThemedMessage.critical(self, "Duplicate Files Skipped",
+                     f"{duplicate_count} duplicate file(s) were skipped based on filename.")
+
+    def remove_file_at_row(self, row):
+        if 0 <= row < len(self.files):
+            removed_path = self.files.pop(row)
+            filename = Path(removed_path).name
+            logging.info(f"Removed file from queue: {filename}")
+        else:
+            logging.warning(f"Tried to remove invalid row: {row}")
+
+        self.table.model.removeRow(row)
 
     def renumber_table(self):
         #for row in range(self.table.rowCount()):
@@ -258,16 +415,17 @@ class MediaMender(QMainWindow):
         #self.table.model.setSupportedDragActions(Qt.MoveAction)
 
     def update_progress(self, value, filename):
-        self.progress.setValue(value)
-        self.status_label.setText(f"Processing: {filename}")
+        with gui_lock:
+            self.progress.setValue(value)
+            self.status_label.setText(f"Processing: {filename}")
 
     def mark_file(self, row, success):
-        color = "#98FB98" if success else "#FF7F7F"
-        for col in range(3):
-            item = self.table.model.item(row, col)
-            if item:
-                item.setBackground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
-        self.table.model.setItem(row, 3, QStandardItem("Done" if success else "Errored"))
+        with gui_lock:
+            for col in range(3):
+                item = self.table.model.item(row, col)
+                if item:
+                    item.setBackground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
+            self.table.model.setItem(row, 3, QStandardItem("Done" if success else "Errored"))
 
     def check_required_paths(self) -> bool:
         config = _load_config()
@@ -338,6 +496,150 @@ if __name__ == "__main__":
     app.setStyleSheet(get_base_stylesheet())
     icon_path = Path(__file__).parent.parent / "resources" / "Icon.JPG"
     app.setWindowIcon(QIcon(str(icon_path)))
+    window = MediaMender(app)
+    window.show()
+    sys.exit(app.exec())
+
+"""
+import sys
+import threading
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QProgressBar, QPushButton, QVBoxLayout, QWidget, QTableView
+from PySide6.QtGui import QStandardItemModel, QStandardItem
+from PySide6.QtCore import Qt
+
+from src.drag_drop_table import DragDropSortableTable
+from src.preferences import PreferencesWindow, load_theme
+from src.theme_manager import apply_theme
+from src.style import get_base_stylesheet
+from src.processing.media_processor import process_media
+from pathlib import Path
+from PySide6.QtCore import QThread, Signal, QObject
+
+import logging
+
+# Global thread lock
+gui_lock = threading.Lock()
+
+class Worker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(int, bool)
+
+    def __init__(self, files, output_dir, trash_dir, dry_run):
+        super().__init__()
+        self.files = files
+        self.output_dir = output_dir
+        self.trash_dir = trash_dir
+        self.dry_run = dry_run
+
+    def run(self):
+        for index, path in enumerate(self.files):
+            try:
+                process_media(path, self.output_dir, self.trash_dir, self.dry_run)
+                self.finished.emit(index, True)
+            except Exception:
+                self.finished.emit(index, False)
+
+class MediaMender(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MediaMender")
+        self.setMinimumSize(800, 600)
+
+        theme = load_theme()
+        apply_theme(QApplication.instance(), theme)
+
+        layout = QVBoxLayout()
+
+        self.status_label = QLabel("Ready")
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+
+        self.table = DragDropSortableTable()
+
+        self.process_button = QPushButton("Start Processing")
+        self.process_button.clicked.connect(self.start_processing)
+
+        self.preferences_button = QPushButton("Preferences")
+        self.preferences_button.clicked.connect(self.open_preferences)
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.table)
+        layout.addWidget(self.process_button)
+        layout.addWidget(self.preferences_button)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+        self.thread = None
+        self.worker = None
+
+    def start_processing(self):
+        files = self.table.get_paths()
+        if not files:
+            return
+
+        self.progress.setMaximum(len(files))
+        self.progress.setValue(0)
+
+        self.thread = QThread()
+        self.worker = Worker(
+            files,
+            self.table.output_dir,
+            self.table.trash_dir,
+            self.table.dry_run
+        )
+        self.worker.moveToThread(self.thread)
+
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.mark_file)
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+
+    def update_progress(self, value, filename):
+        with gui_lock:
+            self.progress.setValue(value)
+            self.status_label.setText(f"Processing: {filename}")
+
+    def mark_file(self, row, success):
+        with gui_lock:
+            for col in range(3):
+                item = self.table.model.item(row, col)
+                if item:
+                    item.setBackground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
+            self.table.model.setItem(row, 3, QStandardItem("Done" if success else "Errored"))
+
+    def reset_table_colors(self):
+        with gui_lock:
+            for row in range(self.table.model.rowCount()):
+                for col in range(self.table.model.columnCount()):
+                    item = self.table.model.item(row, col)
+                    if item:
+                        item.setBackground(Qt.GlobalColor.transparent)
+
+    def append_to_table(self, items):
+        with gui_lock:
+            for item in items:
+                self.table.model.appendRow(item)
+
+    def load_files(self, files):
+        with gui_lock:
+            self.table.model.clear()
+            for path in files:
+                self.table.model.appendRow([QStandardItem(str(path))])
+
+    def open_preferences(self):
+        dlg = PreferencesWindow(self)
+        dlg.exec()
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(get_base_stylesheet())
     window = MediaMender()
     window.show()
     sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+"""

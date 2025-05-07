@@ -1,10 +1,14 @@
+import logging
 import os
 import json
+import shutil
 from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QFileDialog, QCheckBox, QComboBox
 )
+
+from src.logging_utils import configure_logger
 from src.theme_manager import ThemeMode
 from src.dialog import ThemedMessage
 from src.system.gpu_utils import (
@@ -18,6 +22,19 @@ from src.system.gpu_utils import (
 )
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = {
+    "input_dir": str(PROJECT_ROOT / "Input"),
+    "output_dir": str(PROJECT_ROOT / "Output"),
+    "trash_dir": str(PROJECT_ROOT / "Trash"),
+    "tmdb_api_key": "",
+    "log_dir": str(PROJECT_ROOT / "logs"),
+    "dry_run": True,
+    "allow_generation": False,
+    "gpu_enabled": False,
+    "theme": "system",
+    "whisper_model": "base"
+}
 
 class PreferencesWindow(QDialog):
     def __init__(self, parent=None, on_theme_changed=None):
@@ -34,7 +51,7 @@ class PreferencesWindow(QDialog):
         self.output_field = self.create_path_field("Output Folder", self.config.get("output_dir", ""))
         self.trash_field = self.create_path_field("Trash Folder", self.config.get("trash_dir", ""))
         self.tmdb_api_field = self.create_path_field("TMDb API Key", self.config.get("tmdb_api_key", ""))
-        self.log_path_field = self.create_path_field("Log Folder", self.config.get("log_dir", "logs"))
+        self.log_path_field = self.create_path_field("Log Folder", self.config.get("log_dir", ""))
 
         layout.addLayout(self.input_field["layout"])
         layout.addLayout(self.output_field["layout"])
@@ -126,10 +143,25 @@ class PreferencesWindow(QDialog):
 
     def load_config(self):
         if not CONFIG_PATH.exists():
-            self.config = {}
-        else:
+            logging.warning("Config file missing. Using default settings.")
+            self.config = DEFAULT_CONFIG.copy()
+            return
+
+        try:
             with open(CONFIG_PATH, "r") as f:
-                self.config = json.load(f)
+                loaded = json.load(f)
+        except json.JSONDecodeError:
+            logging.error("Config file is corrupted. Using default settings.")
+            self.config = DEFAULT_CONFIG.copy()
+            return
+
+        # Merge loaded config with defaults (fill missing or blank values)
+        self.config = {}
+        for key, default in DEFAULT_CONFIG.items():
+            value = loaded.get(key, default)
+            if isinstance(value, str):
+                value = value.strip()
+            self.config[key] = value if value != "" else default
 
     def save_preferences(self):
         self.config["input_dir"] = self.input_field["field"].text()
@@ -138,9 +170,6 @@ class PreferencesWindow(QDialog):
         self.config["tmdb_api_key"] = self.tmdb_api_field["field"].text()
         self.config["log_dir"] = self.log_path_field["field"].text()
         self.config["whisper_model"] = self.whisper_model_combo.currentText()
-        #self.config["prohibit_extraction"] = self.prohibit_extraction.isChecked()
-        #self.config["prohibit_downloads"] = self.prohibit_downloads.isChecked()
-        #self.config["prohibit_encoding"] = self.prohibit_encoding.isChecked()
         self.config["allow_generation"] = self.allow_generation.isChecked()
         self.config["dry_run"] = self.dry_run_checkbox.isChecked()
         self.config["gpu_enabled"] = self.gpu_checkbox.isChecked()
@@ -155,10 +184,14 @@ class PreferencesWindow(QDialog):
         dialog.setStyle(self.style())  # Ensure style inheritance
         dialog.exec()
 
+        new_log_path = Path(self.log_path_field["field"].text().strip())
+        configure_logger(new_log_path, reuse_existing=True)
+
         after_preferences_saved(self.config, dry_run=self.config.get("dry_run", False))
 
         if self.on_theme_changed:
             self.on_theme_changed()
+        self.accept()
 
 # Utility functions for use in main.py
 def load_theme() -> ThemeMode:
@@ -185,7 +218,9 @@ def _load_config() -> dict:
             return json.load(f)
     return {}
 
-def _write_config(config: dict):
+def _write_config(new_data: dict):
+    config = _load_config()
+    config.update(new_data)  # merge instead of overwrite
     os.makedirs(CONFIG_PATH.parent, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
@@ -282,3 +317,28 @@ def after_preferences_saved(config, dry_run=False):
     else:
         config["gpu_enabled"] = False
         _write_config(config)
+
+def reinitialize_logger(new_log_dir: Path):
+    global CURRENT_LOG_FILE
+
+    # Ensure new directory exists
+    new_log_dir.mkdir(parents=True, exist_ok=True)
+
+    new_log_path = new_log_dir / CURRENT_LOG_FILE.name
+
+    # Copy existing log file to new location
+    shutil.copy2(CURRENT_LOG_FILE, new_log_path)
+
+    # Reconfigure logging to new file
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+        handler.close()
+
+    logging.basicConfig(
+        filename=new_log_path,
+        filemode="a",
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+
+    CURRENT_LOG_FILE = new_log_path

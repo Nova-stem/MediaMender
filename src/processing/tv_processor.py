@@ -33,9 +33,6 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
     tmdb_show_title = enriched.get("title", show_title)
 
     # 3. Build output filename
-    safe_title = sanitize_filename(tmdb_show_title)
-    safe_ep_title = sanitize_filename(episode_title)
-    ep_code = f"S{season:02d}E{episode:02d}"
     aspect = detect_aspect_ratio(file_path)
     source = detect_source_format(file_path.name)
 
@@ -46,7 +43,7 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
 
     safe_title = sanitize_filename(show_title)
     safe_ep_title = sanitize_filename(episode_title)
-    output_name = f"{safe_title} - S{int(season):02d}E{int(episode):02d} - {safe_ep_title}.mkv"
+    output_name = f"{safe_title} - S{int(season):02d}E{int(episode):02d} - {safe_ep_title} [{source}][{aspect}].mkv"
     output_path = output_dir / output_name
 
     if output_path.exists():

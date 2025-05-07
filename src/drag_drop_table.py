@@ -1,8 +1,12 @@
-from PySide6.QtWidgets import QTableView, QAbstractItemView, QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QStyle
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QDrag, QPainter, QPen, QColor
-from PySide6.QtCore import Qt, QModelIndex, QMimeData
+from PySide6.QtWidgets import QTableView, QAbstractItemView, QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, \
+    QStyle, QMenu
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QDrag, QPainter, QPen, QColor, QAction
+from PySide6.QtCore import Qt, QModelIndex, QMimeData, Signal
 
 class DragDropSortableTable(QTableView):
+    row_remove_requested = Signal(int)
+    files_dropped = Signal(tuple)  # (file_paths, target_row)
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -28,6 +32,9 @@ class DragDropSortableTable(QTableView):
         header.setSectionResizeMode(QHeaderView.Stretch)
         header.sectionClicked.connect(self.on_header_clicked)
 
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
     def add_row(self, row_data):
         row_index = self.model.rowCount()
         items = [QStandardItem(str(row_index + 1))] + [QStandardItem(x) for x in row_data]
@@ -49,7 +56,50 @@ class DragDropSortableTable(QTableView):
 
         return self.model.rowCount()  # Default: drop at end
 
+    """def dropEvent(self, event):
+        if self.model.rowCount() == 0:
+            return
+
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+
+        source_row = indexes[0].row()
+        pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+        target_row = self._get_drop_target_row(pos)
+
+        if target_row > source_row:
+            target_row -= 1
+        if target_row == source_row:
+            return
+
+        items = [self.model.item(source_row, col).clone() for col in range(self.model.columnCount())]
+        self.model.removeRow(source_row)
+        self.model.insertRow(target_row, items)
+        self.renumber_rows()
+
+        self._drag_hover_pos = None
+        self.viewport().update()
+        event.acceptProposedAction() """
+
     def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            # Handle external file drop
+            file_paths = [
+                url.toLocalFile()
+                for url in event.mimeData().urls()
+                if url.isLocalFile()
+            ]
+
+            pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+            target_row = self._get_drop_target_row(pos)
+
+            # Emit with insertion position
+            self.files_dropped.emit((file_paths, target_row))
+            event.acceptProposedAction()
+            return
+
+        # Internal reorder logic (preserve your original code)
         if self.model.rowCount() == 0:
             return
 
@@ -124,9 +174,16 @@ class DragDropSortableTable(QTableView):
         drag.setMimeData(mime_data)
         drag.exec(Qt.MoveAction)
 
+    #def dragEnterEvent(self, event):
+    #    event.setDropAction(Qt.MoveAction)
+    #    event.accept()
+
     def dragEnterEvent(self, event):
-        event.setDropAction(Qt.MoveAction)
-        event.accept()
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
 
     def dragMoveEvent(self, event):
         pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
@@ -174,6 +231,25 @@ class DragDropSortableTable(QTableView):
             self.clearSelection()
         else:
             super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.pos())
+        if not index.isValid():
+            self.clearSelection()
+        super().mousePressEvent(event)
+
+    def _show_context_menu(self, pos):
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        menu = QMenu(self)
+        remove_action = QAction("Remove", self)
+        remove_action.triggered.connect(lambda: self.row_remove_requested.emit(row))
+        menu.addAction(remove_action)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
 
 class NoFocusDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index: QModelIndex):
