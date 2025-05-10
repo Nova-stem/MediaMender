@@ -26,6 +26,8 @@ from src.processing.media_processor import detect_media_type, process_media
 from src.style import get_base_stylesheet
 from src.theme_manager import apply_theme
 from src.logging_utils import configure_logger, CURRENT_LOG_FILE
+from models.media_item import MediaItem, get_media_items
+
 
 gui_lock = threading.Lock()
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
@@ -74,7 +76,7 @@ class MediaMender(QMainWindow):
         self.setGeometry(100, 100, 800, 500)
         self.worker = None
 
-        self.files = []
+        self.media_items: list[MediaItem] = []
         self.config = self.load_config()
 
         self.setup_ui()
@@ -209,9 +211,9 @@ class MediaMender(QMainWindow):
 
         border_color = palette.color(QPalette.Light).name()
 
-        header = self.table.horizontalHeader()
+        header = self.table.header()
         header.sectionClicked.connect(self.renumber_table)
-        header = self.table.horizontalHeader()
+        #header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)  # Allow manual resizing
         header.setSectionsClickable(True)
         header.setStretchLastSection(False)  # Keep fixed widths
@@ -240,7 +242,7 @@ class MediaMender(QMainWindow):
 
         # Stretch last column
         header.setStretchLastSection(True)
-        self.table.verticalHeader().setVisible(False)
+        #self.table.verticalHeader().setVisible(False)
 
         layout.addLayout(top_bar)
         layout.addWidget(self.table)
@@ -254,29 +256,28 @@ class MediaMender(QMainWindow):
 
     def add_files_from_drop(self, data):
         file_paths, target_row = data
-        existing_filenames = {Path(f).name.lower() for f in self.files}
+        existing_filenames = {item.basename.lower() for item in self.media_items}
+        new_items = []
 
-        for path in file_paths:
-            filename = Path(path).name
-            if filename.lower() in existing_filenames:
-                logging.info(f"Skipped duplicate file: {filename}")
-                ThemedMessage.critical(self, "Duplicate File", f"The file '{filename}' is already in the queue.")
+        for path_str in file_paths:
+            path = Path(path_str).resolve()
+            name = path.name.lower()
+
+            if name in existing_filenames:
+                logging.info(f"Skipped duplicate file: {name}")
+                ThemedMessage.critical(self, "Duplicate File", f"The file '{name}' is already in the queue.")
                 continue
 
-            self.files.insert(target_row, path)
-            media_type = detect_media_type(Path(path))
+            item = MediaItem(path=path, source='drag')
+            new_items.append(item)
+            existing_filenames.add(name)
 
-            row_items = [
-                QStandardItem(""),  # will be renumbered
-                QStandardItem(filename),
-                QStandardItem(media_type),
-                QStandardItem("Pending")
-            ]
-            self.table.model.insertRow(target_row, row_items)
-            target_row += 1
-            logging.info(f"File added via external drop: {filename}")
-
-        self.renumber_table()
+        # Insert at target_row
+        if target_row == -1:
+            self.media_items.extend(new_items)
+        else:
+            self.media_items[target_row:target_row] = new_items
+        self.table.load_items(self.media_items)
 
     def open_preferences(self):
         pref = PreferencesWindow(self)
@@ -289,13 +290,13 @@ class MediaMender(QMainWindow):
             return json.load(f)
 
     def unload_files(self):
-        if not self.files:
+        if not self.media_items:
             return
 
         response = ThemedMessage.question(self,"Unload All Files","Are you sure you want to remove all loaded files?",["Yes", "Cancel"] )
 
         if response == "Yes":
-            self.files.clear()
+            self.media_items.clear()
             self.table.model.removeRows(0, self.table.model.rowCount())
             self.renumber_table()
             logging.info("All files have been unloaded.")
@@ -304,46 +305,42 @@ class MediaMender(QMainWindow):
         config = _load_config()
         input_dir = Path(config.get("input_dir", ""))
         if not input_dir.exists():
-            dialog = ThemedMessage("Invalid Directory", "The input directory does not exist.", self)
-            dialog.setPalette(self.palette())
-            dialog.setStyle(self.style())
-            dialog.exec()
+            ThemedMessage("Invalid Directory", "The input directory does not exist.", self).exec()
             return
 
-        # List and sort files
-        all_files = [f for f in input_dir.glob("*") if f.is_file()]
-        all_files.sort(key=lambda f: f.name.lower())
+        # Keep dragged items
+        self.media_items = [item for item in self.media_items if item.source == 'drag']
 
-        seen_filenames = set()
-        unique_files = []
+        # Load new items from folder
+        new_items = get_media_items(input_dir, source='load')
+        all_items = self.media_items + new_items
+
+        # Filter duplicates by filename (case-insensitive)
+        seen = set()
+        filtered = []
         duplicate_count = 0
 
-        for f in all_files:
-            name = f.name.lower()
-            if name in seen_filenames:
+        for item in all_items:
+            name = item.basename.lower()
+            if name in seen:
                 duplicate_count += 1
                 continue
-            seen_filenames.add(name)
-            unique_files.append(str(f))
+            seen.add(name)
+            filtered.append(item)
 
-        self.files = unique_files
-
-        # Reset table and load only unique files
-        self.table.model.removeRows(0, self.table.model.rowCount())
-        for file_path in self.files:
-            file_name = Path(file_path).name
-            media_type = detect_media_type(Path(file_path))
-            self.table.add_row([file_name, media_type, "Pending"])
-
-        self.renumber_table()
+        self.media_items = filtered
+        self.table.load_items(self.media_items)
 
         if duplicate_count > 0:
-            ThemedMessage.critical(self, "Duplicate Files Skipped",
-                     f"{duplicate_count} duplicate file(s) were skipped based on filename.")
+            ThemedMessage.critical(
+                self,
+                "Duplicate Files Skipped",
+                f"{duplicate_count} duplicate file(s) were skipped based on filename."
+            )
 
     def remove_file_at_row(self, row):
-        if 0 <= row < len(self.files):
-            removed_path = self.files.pop(row)
+        if 0 <= row < len(self.media_items):
+            removed_path = self.media_items.pop(row)
             filename = Path(removed_path).name
             logging.info(f"Removed file from queue: {filename}")
         else:
@@ -361,7 +358,7 @@ class MediaMender(QMainWindow):
         self.table.resizeColumnToContents(0)
 
     def start_processing(self):
-        if not self.files:
+        if not self.media_items:
             dialog = ThemedMessage("No Files", "There are no files to process.", self)
             dialog.setPalette(self.palette())  # Apply current theme
             dialog.setStyle(self.style())  # Ensure style inheritance
@@ -386,7 +383,7 @@ class MediaMender(QMainWindow):
         self.lock_table()
 
         self.update_file_order()
-        self.worker = WorkerThread(self.files, self.output_dir, self.trash_dir, self.log_dir, self.dry_run)
+        self.worker = WorkerThread(self.media_items, self.output_dir, self.trash_dir, self.log_dir, self.dry_run)
         self.worker.update_progress.connect(self.update_progress)
         self.worker.file_done.connect(self.mark_file)
         self.worker.start()
@@ -441,18 +438,27 @@ class MediaMender(QMainWindow):
 
     def update_file_order(self):
         new_order = []
-        seen = set()
-        for row in range(self.table.model.rowCount()):
-            filename = self.table.model.item(row, 1).text()
-            for f in self.files:
-                if Path(f).name == filename and f not in seen:
-                    new_order.append(f)
-                    seen.add(f)
-                    break
-        self.files = new_order
-        self.renumber_table()
 
-    def dropEvent(self, event):
+        def walk_items(parent_item: QStandardItem):
+            for i in range(parent_item.rowCount()):
+                row_item = parent_item.child(i, 0)
+                media_item = row_item.data(Qt.UserRole)
+                if media_item:
+                    new_order.append(media_item)
+                if row_item.hasChildren():
+                    walk_items(row_item)
+
+        for i in range(self.table.model.rowCount()):
+            folder_item = self.table.model.item(i, 0)
+            folder_media_item = folder_item.data(Qt.UserRole)
+            if folder_media_item:
+                new_order.append(folder_media_item)
+            if folder_item.hasChildren():
+                walk_items(folder_item)
+
+        self.media_items = new_order
+
+    def dropEvent_OLD(self, event):
         if not self.table.selectedIndexes():
             return
 
@@ -472,10 +478,14 @@ class MediaMender(QMainWindow):
         if target_row > source_row:
             target_row -= 1
 
-        items = [self.table.model.item(source_row, col).clone() for col in range(self.table.model.columnCount())]
+        items = []
+        for col in range(self.table.model.columnCount()):
+            cell = self.table.model.item(source_row, col)
+            if cell is not None:
+                items.append(cell.clone())
         self.table.model.removeRow(source_row)
         self.table.model.insertRow(target_row, items)
-        self.table.renumber_rows()
+        self.table.renumber_visible_rows()
 
         self.table._drag_hover_pos = None
         self.table.viewport().update()
@@ -499,147 +509,3 @@ if __name__ == "__main__":
     window = MediaMender(app)
     window.show()
     sys.exit(app.exec())
-
-"""
-import sys
-import threading
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QProgressBar, QPushButton, QVBoxLayout, QWidget, QTableView
-from PySide6.QtGui import QStandardItemModel, QStandardItem
-from PySide6.QtCore import Qt
-
-from src.drag_drop_table import DragDropSortableTable
-from src.preferences import PreferencesWindow, load_theme
-from src.theme_manager import apply_theme
-from src.style import get_base_stylesheet
-from src.processing.media_processor import process_media
-from pathlib import Path
-from PySide6.QtCore import QThread, Signal, QObject
-
-import logging
-
-# Global thread lock
-gui_lock = threading.Lock()
-
-class Worker(QObject):
-    progress = Signal(int, str)
-    finished = Signal(int, bool)
-
-    def __init__(self, files, output_dir, trash_dir, dry_run):
-        super().__init__()
-        self.files = files
-        self.output_dir = output_dir
-        self.trash_dir = trash_dir
-        self.dry_run = dry_run
-
-    def run(self):
-        for index, path in enumerate(self.files):
-            try:
-                process_media(path, self.output_dir, self.trash_dir, self.dry_run)
-                self.finished.emit(index, True)
-            except Exception:
-                self.finished.emit(index, False)
-
-class MediaMender(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("MediaMender")
-        self.setMinimumSize(800, 600)
-
-        theme = load_theme()
-        apply_theme(QApplication.instance(), theme)
-
-        layout = QVBoxLayout()
-
-        self.status_label = QLabel("Ready")
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-
-        self.table = DragDropSortableTable()
-
-        self.process_button = QPushButton("Start Processing")
-        self.process_button.clicked.connect(self.start_processing)
-
-        self.preferences_button = QPushButton("Preferences")
-        self.preferences_button.clicked.connect(self.open_preferences)
-
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.table)
-        layout.addWidget(self.process_button)
-        layout.addWidget(self.preferences_button)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-        self.thread = None
-        self.worker = None
-
-    def start_processing(self):
-        files = self.table.get_paths()
-        if not files:
-            return
-
-        self.progress.setMaximum(len(files))
-        self.progress.setValue(0)
-
-        self.thread = QThread()
-        self.worker = Worker(
-            files,
-            self.table.output_dir,
-            self.table.trash_dir,
-            self.table.dry_run
-        )
-        self.worker.moveToThread(self.thread)
-
-        self.worker.progress.connect(self.update_progress)
-        self.worker.finished.connect(self.mark_file)
-        self.thread.started.connect(self.worker.run)
-        self.thread.start()
-
-    def update_progress(self, value, filename):
-        with gui_lock:
-            self.progress.setValue(value)
-            self.status_label.setText(f"Processing: {filename}")
-
-    def mark_file(self, row, success):
-        with gui_lock:
-            for col in range(3):
-                item = self.table.model.item(row, col)
-                if item:
-                    item.setBackground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
-            self.table.model.setItem(row, 3, QStandardItem("Done" if success else "Errored"))
-
-    def reset_table_colors(self):
-        with gui_lock:
-            for row in range(self.table.model.rowCount()):
-                for col in range(self.table.model.columnCount()):
-                    item = self.table.model.item(row, col)
-                    if item:
-                        item.setBackground(Qt.GlobalColor.transparent)
-
-    def append_to_table(self, items):
-        with gui_lock:
-            for item in items:
-                self.table.model.appendRow(item)
-
-    def load_files(self, files):
-        with gui_lock:
-            self.table.model.clear()
-            for path in files:
-                self.table.model.appendRow([QStandardItem(str(path))])
-
-    def open_preferences(self):
-        dlg = PreferencesWindow(self)
-        dlg.exec()
-
-def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet(get_base_stylesheet())
-    window = MediaMender()
-    window.show()
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
-"""

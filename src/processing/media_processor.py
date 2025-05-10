@@ -35,7 +35,7 @@ def process_media(file_path: Path, output_dir: Path, trash_dir: Path, dry_run: b
 
         # Unsupported
         else:
-            logging.warning(f"⚠Unsupported file type: {file_path.name}")
+            logging.warning(f"Unsupported file type: {file_path.name}")
             move_to_trash(file_path, trash_dir, dry_run)
 
     except Exception as e:

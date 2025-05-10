@@ -195,6 +195,7 @@ def extract_metadata_from_filename(file_path: str) -> dict:
     if suffix_match:
         metadata["original_suffix"] = suffix_match.group(1)
         name = name[:suffix_match.start()].strip()
+        logging.info(f"{suffix_match.group(1)}")
 
     # Lowercase for normalization
     normalized = name.lower()
@@ -219,8 +220,14 @@ def extract_metadata_from_filename(file_path: str) -> dict:
     normalized = re.sub(r'[._\-]', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized).strip()
 
-    # 5. Title assembly
+    # 5. Remove empty brackets, parentheses, and braces
+    normalized = re.sub(r'\(\s*\)', '', normalized)
+    normalized = re.sub(r'\[\s*\]', '', normalized)
+    normalized = re.sub(r'\{\s*\}', '', normalized)
+
+    # 6. Title assembly
     tokens = normalized.split()
+    #logging.info(f"Tokens: {tokens}")
     title_tokens = [
         t for t in tokens
         if not re.match(r's\d{1,2}e\d{1,2}', t)
@@ -250,6 +257,7 @@ def validate_with_tmdb(metadata: dict, media_type: str = "movie") -> dict:
 
     query = metadata["title"]
     year = metadata.get("year")
+    logging.info("TBDb metadata enrichment in progress...")
 
     if media_type == "movie":
         results = Search().movies(query)
@@ -420,11 +428,11 @@ def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool):
         counter += 1
 
     if dry_run:
-        logging.info(f"[DRY RUN] Moved to trash: {file_path.name} → {dest.name}")
+        logging.info(f"[DRY RUN] Moved to trash: {file_path.name} -> {dest.name}")
         return
 
     file_path.rename(dest)
-    logging.info(f"Moved to trash: {file_path.name} → {dest.name}")
+    logging.info(f"Moved to trash: {file_path.name} -> {dest.name}")
 
 def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
     logging.info(f"Scanning for non-English (forced) segments in: {file_path.name}")

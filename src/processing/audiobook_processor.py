@@ -91,14 +91,14 @@ def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = Fa
             srt_path = generate_normal_subtitles_from_audio(merged_path, srt_path, whisper_model, dry_run)
             chapters = parse_chapters_from_srt(srt_path)
         except Exception as e:
-            logging.warning(f"⚠️ Whisper transcription failed: {e}")
+            logging.warning(f"Whisper transcription failed: {e}")
     elif not allow_generation:
-        logging.info(f"💡 Subtitle generation disabled. Enable it in Preferences for better chapter detection.")
+        logging.info(f"Subtitle generation disabled. Enable it in Preferences for better chapter detection.")
 
     # Step 5: Expected chapter sanity check
     expected_count = get_expected_chapter_count(book_title)
     if expected_count and (len(chapters) < 0.5 * expected_count or len(chapters) > 2.5 * expected_count):
-        logging.warning(f"⚠️ Chapter mismatch. Expected ~{expected_count}, detected {len(chapters)}. Skipping chapters.")
+        logging.warning(f"Chapter mismatch. Expected ~{expected_count}, detected {len(chapters)}. Skipping chapters.")
         chapters = []
 
     cmd = [
@@ -132,4 +132,4 @@ def process_audiobook(file_path: Path, base_output_dir: Path, dry_run: bool = Fa
     if srt_path.exists():
         move_to_trash(srt_path, dry_run)
 
-    logging.info(f"✅ [Audiobook] Finished: {m4b_path.name}")
+    logging.info(f"[Audiobook] Finished: {m4b_path.name}")

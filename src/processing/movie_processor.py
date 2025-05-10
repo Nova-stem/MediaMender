@@ -14,7 +14,7 @@ from src.processing.common_utils import (
 )
 
 def process_movie(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run: bool):
-    logging.info(f"🎬 [Movie] Starting: {file_path.name}")
+    logging.info(f"[Movie] Starting: {file_path.name}")
 
     # 1. Metadata
     metadata = extract_metadata_from_filename(file_path.name)
@@ -29,11 +29,12 @@ def process_movie(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_r
     output_dir = get_output_path_for_media("movie", metadata, base_output_dir)
 
     safe_title = sanitize_filename(title)
-    output_name = f"{safe_title} ({year}) [{source}][{aspect}].mkv"
+    output_name = f"{safe_title} ({year}) [{source} {aspect}].mkv"
     output_path = output_dir / output_name
-
+    #logging.info(f"[INFO ONLY] output: {output_path}")
+    #logging.info(f"[INFO ONLY] title: {safe_title}, year: {year}, aspect: {aspect}, source: {source}")
     if output_path.exists():
-        logging.info(f"⏩ Skipping: output already exists at {output_path}")
+        logging.info(f"Skipping: output already exists at {output_path}")
         return
 
     # 3. Subtitles
@@ -54,7 +55,7 @@ def process_movie(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_r
             cmd += ["--forced-track", "0"]
         cmd.append(str(sub_path))
 
-    logging.info(f"📦 Remuxing: {' '.join(cmd)}")
+    logging.info(f"Remuxing: {' '.join(cmd)}")
     if not dry_run:
         subprocess.run(cmd, check=True)
 
@@ -67,4 +68,4 @@ def process_movie(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_r
         if orig_path and orig_path.exists():
             move_to_trash(orig_path, trash_dir, dry_run)
 
-    logging.info(f"✅ [Movie] Finished: {output_path.name}")
+    logging.info(f"[Movie] Finished: {output_path.name}")

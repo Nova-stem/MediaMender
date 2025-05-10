@@ -15,7 +15,7 @@ from src.processing.common_utils import (
 )
 
 def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run: bool):
-    logging.info(f"📺 [TV] Starting: {file_path.name}")
+    logging.info(f"[TV] Starting: {file_path.name}")
 
     # 1. Metadata from filename
     metadata = extract_metadata_from_filename(file_path.name)
@@ -24,7 +24,7 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
     episode = metadata.get("episode")
 
     if season is None or episode is None:
-        logging.warning(f"⚠️ Could not extract season/episode from filename: {file_path.name}")
+        logging.warning(f"Could not extract season/episode from filename: {file_path.name}")
         return
 
     # 2. Enrich with TMDb
@@ -43,7 +43,7 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
 
     safe_title = sanitize_filename(show_title)
     safe_ep_title = sanitize_filename(episode_title)
-    output_name = f"{safe_title} - S{int(season):02d}E{int(episode):02d} - {safe_ep_title} [{source}][{aspect}].mkv"
+    output_name = f"{safe_title} - S{int(season):02d}E{int(episode):02d} - {safe_ep_title} [{source} {aspect}].mkv"
     output_path = output_dir / output_name
 
     if output_path.exists():
@@ -68,7 +68,7 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
             cmd += ["--forced-track", "0"]
         cmd.append(str(sub_path))
 
-    logging.info(f"📦 Remuxing: {' '.join(cmd)}")
+    logging.info(f"Remuxing: {' '.join(cmd)}")
     if not dry_run:
         subprocess.run(cmd, check=True)
 
@@ -81,4 +81,4 @@ def process_tv(file_path: Path, base_output_dir: Path, trash_dir: Path, dry_run:
         if sub_path.exists():
             move_to_trash(sub_path, trash_dir, dry_run)
 
-    logging.info(f"✅ [TV] Finished: {output_path.name}")
+    logging.info(f"[TV] Finished: {output_path.name}")
