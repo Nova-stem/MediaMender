@@ -2,7 +2,8 @@ import hashlib
 import os
 from pathlib import Path
 from typing import Optional
-
+from src.system.safety import require_safe_path
+import logging
 
 class MediaItem:
     def __init__(self, path: Path, source: str, root: Optional[Path] = None):
@@ -51,8 +52,14 @@ class MediaItem:
     def __repr__(self):
         return f"<MediaItem {self.basename} depth={self.depth} source={self.source}>"
 
-def get_media_items(base_path: Path, source: str) -> list[MediaItem]:
+def get_media_items(base_path: Path, source: str, logger=None) -> list[MediaItem]:
     items = []
+    logger = logger or logging.getLogger(__name__)
+    try:
+        require_safe_path(base_path, "Media Input Root", logger=logger)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return []
 
     for root, dirs, files in os.walk(base_path):
         root_path = Path(root)

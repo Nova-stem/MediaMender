@@ -1,5 +1,5 @@
 # src/processing/common_utils.py
-
+import asyncio
 #Standard
 import datetime
 import difflib
@@ -10,7 +10,7 @@ import platform
 import re
 import shutil
 import string
-import subprocess
+#import subprocess
 import zipfile
 from datetime import time
 from pathlib import Path
@@ -24,8 +24,10 @@ from srt import Subtitle, compose
 from tmdbv3api import Movie, Search, TMDb, TV
 
 #Local
-from src.dialog import ThemedMessage
+#from src.dialog import ThemedMessage
 from src.preferences import get_tmdb_api_key, get_whisper_model, is_generation_allowed
+from src.system.async_utils import run_subprocess_capture, stream_subprocess
+from src.system.safety import is_safe_to_trash, is_safe_path, require_safe_path
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_TARGET = Path("resources/ffmpeg/ffmpeg.exe")
@@ -54,6 +56,10 @@ BRANDING_PATTERNS = [
     [".admit"], ["subtitled", "by"], ["muntasir"], [".co"]
 ]
 
+VIDEO_EXTENSIONS = [".mp4", ".mkv", ".avi", ".mov"]
+AUDIO_EXTENSIONS = [".mp3", ".m4a", ".aac", ".flac", ".wav"]
+SUBTITLE_EXTENSIONS = [".srt", ".ass", ".vtt", ".sub"]
+
 def load_ignored_names() -> set[str]:
     global _ignored_names_cache
     if _ignored_names_cache is not None:
@@ -69,20 +75,36 @@ def load_ignored_names() -> set[str]:
     return _ignored_names_cache
 ignored_names = load_ignored_names()
 
-def detect_aspect_ratio(file_path: Path) -> str:
-    """Detects aspect ratio using ffprobe and returns label."""
+def detect_aspect_ratio(file_path: Path, logger=None) -> str:
+    """Detects aspect ratio using ffprobe and returns a label: Fullscreen, Widescreen, or Ultrawide."""
+    logger = logger or logging.getLogger(__name__)
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path)
+    ]
+
     try:
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(file_path)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        width, height = map(int, result.stdout.strip().split('\n'))
-        ratio = width / height
+        result = asyncio.run(run_subprocess_capture(cmd, logger=logger))
+        if not result:
+            logger.warning(f"ffprobe returned no output for {file_path.name}")
+            return "Widescreen"
+
+        lines = result.strip().splitlines()
+        if len(lines) != 2:
+            logger.warning(f"Unexpected ffprobe output for {file_path.name}: {lines}")
+            return "Widescreen"
+
+        try:
+            width, height = map(int, lines)
+            ratio = width / height
+        except Exception:
+            logger.warning(f"Could not parse width/height from ffprobe output: {lines}")
+            return "Widescreen"
 
         if ratio < 1.6:
             return "Fullscreen"
@@ -90,8 +112,9 @@ def detect_aspect_ratio(file_path: Path) -> str:
             return "Widescreen"
         else:
             return "Ultrawide"
+
     except Exception as e:
-        print(f"Aspect ratio detection failed: {e}")
+        logger.warning(f"Aspect ratio detection failed for {file_path.name}: {e}")
         return "Widescreen"
 
 def detect_source_format(file_name: str) -> str:
@@ -180,8 +203,9 @@ def correct_subtitle_typos(text: str) -> tuple[str, list[dict]]:
 
     return "\n".join(corrected_lines), correction_log
 
-def extract_metadata_from_filename(file_path: str) -> dict:
+def extract_metadata_from_filename(file_path: str, logger=None) -> dict:
     name = Path(file_path).stem
+    logger = logger or logging.getLogger(__name__)
     metadata = {
         "title": None,
         "year": None,
@@ -195,7 +219,7 @@ def extract_metadata_from_filename(file_path: str) -> dict:
     if suffix_match:
         metadata["original_suffix"] = suffix_match.group(1)
         name = name[:suffix_match.start()].strip()
-        logging.info(f"{suffix_match.group(1)}")
+        logger.info(f"{suffix_match.group(1)}")
 
     # Lowercase for normalization
     normalized = name.lower()
@@ -227,7 +251,6 @@ def extract_metadata_from_filename(file_path: str) -> dict:
 
     # 6. Title assembly
     tokens = normalized.split()
-    #logging.info(f"Tokens: {tokens}")
     title_tokens = [
         t for t in tokens
         if not re.match(r's\d{1,2}e\d{1,2}', t)
@@ -244,20 +267,21 @@ def set_tmdb_warning_callback(callback: callable):
     global _tmdb_warning_callback
     _tmdb_warning_callback = callback
 
-def validate_with_tmdb(metadata: dict, media_type: str = "movie") -> dict:
+def validate_with_tmdb(metadata: dict, media_type: str = "movie", logger=None) -> dict:
+    logger = logger or logging.getLogger(__name__)
     """Validate and enrich metadata using TMDb."""
     global _tmdb_warning_shown
 
     api_key = get_tmdb_api_key()
     if not api_key:
         if not _tmdb_warning_shown:
-            logging.warning("TMDb API key is missing. Metadata lookup skipped.")
+            logger.warning("TMDb API key is missing. Metadata lookup skipped.")
             _tmdb_warning_shown = True
         return metadata
 
     query = metadata["title"]
     year = metadata.get("year")
-    logging.info("TBDb metadata enrichment in progress...")
+    logger.info("TBDb metadata enrichment in progress...")
 
     if media_type == "movie":
         results = Search().movies(query)
@@ -283,7 +307,8 @@ def validate_with_tmdb(metadata: dict, media_type: str = "movie") -> dict:
 
     return metadata  # fallback to original if nothing found
 
-def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: bool) -> list[dict]:
+def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: bool, logger=None) -> list[dict]:
+    logger = logger or logging.getLogger(__name__)
     subtitle_tracks = find_all_subtitles(video_path)
     prepared = []
 
@@ -296,15 +321,13 @@ def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: boo
         if original.suffix.lower() != ".srt":
             converted = original.with_suffix(".converted.srt")
             try:
-                if dry_run:
-                    logging.info(f"[DRY RUN] Would convert subtitle: {original.name}")
-                    sub_path = converted
-                else:
-                    subprocess.run(["ffmpeg", "-y", "-i", str(original), str(converted)], check=True)
-                    sub_path = converted
-                    move_to_trash(original, trash_dir, dry_run)
+                logger.info(f"Converting Subtitles: {original} to {converted}")
+                sub_path = converted
+                if not dry_run:
+                    asyncio.run(convert_subtitle(original, converted, logger))
+                    move_to_trash(original, trash_dir, dry_run, logger=logger)
             except Exception as e:
-                logging.warning(f"Subtitle conversion failed: {e}")
+                logger.warning(f"Subtitle conversion failed: {e}")
                 continue
 
         # Clean + correct
@@ -314,8 +337,12 @@ def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: boo
             corrected, corrections = correct_subtitle_typos(cleaned)
 
             cleaned_path = sub_path.with_name(sub_path.stem + ".cleaned.srt")
+            if not is_safe_path(cleaned_path, logger=logger):
+                logger.warning(f"Unsafe subtitle output path: {cleaned_path}. Skipping.")
+                continue
+
             if dry_run:
-                logging.info(f"[DRY RUN] Would write cleaned subtitle: {cleaned_path.name}")
+                logger.info(f"Would write cleaned subtitle: {cleaned_path.name}")
             else:
                 cleaned_path.write_text(corrected, encoding="utf-8")
                 if corrections:
@@ -326,7 +353,7 @@ def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: boo
                                 f"Line {entry['line']}, Word {entry['word']}: "
                                 f"{entry['original']} → {entry['corrected']}\n"
                             )
-                    logging.info(f"Logged {len(corrections)} subtitle corrections to: {log_path.name}")
+                    logger.info(f"Logged {len(corrections)} subtitle corrections to: {log_path.name}")
 
             prepared.append({
                 "path": cleaned_path,
@@ -335,23 +362,24 @@ def prepare_subtitles_for_muxing(video_path: Path, trash_dir: Path, dry_run: boo
             })
 
         except Exception as e:
-            logging.warning(f"Subtitle cleanup failed for {original.name}: {e}")
+            logger.warning(f"Subtitle cleanup failed for {original.name}: {e}")
 
     # Fallback generation if no usable subtitles found
     if not prepared:
-        logging.info("No usable subtitles found.")
+        logger.info("No usable subtitles found.")
 
         if is_generation_allowed():
-            logging.info("Generating subtitles from audio...")
+            logger.info("Generating subtitles from audio...")
             normal_srt = video_path.with_name(video_path.stem + ".normal.srt")
-            if generate_normal_subtitles_from_audio(video_path, normal_srt, dry_run):
+            forced_srt = video_path.with_name(video_path.stem + ".forced.srt")
+
+            if generate_normal_subtitles_from_audio(video_path, normal_srt, dry_run, logger=logger):
                 prepared.append({"path": normal_srt, "type": "normal"})
 
-            forced_srt = video_path.with_name(video_path.stem + ".forced.srt")
-            if generate_forced_subtitles_from_audio(video_path, forced_srt, dry_run):
+            if generate_forced_subtitles_from_audio(video_path, forced_srt, dry_run, logger=logger):
                 prepared.append({"path": forced_srt, "type": "forced"})
         else:
-            logging.info("Subtitle generation is disabled. Enable 'Allow Generation' in preferences to use Whisper.")
+            logger.info("Subtitle generation is disabled. Enable 'Allow Generation' in preferences to use Whisper.")
 
     return prepared
 
@@ -403,99 +431,108 @@ def find_all_subtitles(file_path: Path, threshold: float = 0.75) -> list[dict]:
 
     return results
 
-def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool):
+def move_to_trash(file_path: Path, trash_dir: Path, dry_run: bool, logger=None):
     """
-    Moves a file to the specified trash directory. Honors dry run and safety checks.
+    Moves a file to the specified trash directory.
+    Enforces safety and dry run logging.
     """
+    logger = logger or logging.getLogger(__name__)
+
     if not file_path.exists():
+        logger.warning(f"File does not exist: {file_path}")
         return
 
-    if dry_run and not is_safe_to_trash(file_path):
-        logging.warning(f"[DRY RUN] Refusing to trash file outside of safe zones: {file_path}")
+    if not is_safe_to_trash(file_path, logger=logger):
+        logger.warning(f"Refusing to trash file outside of safe zones: {file_path}")
         return
 
-    if not is_safe_to_trash(file_path):
-        logging.warning(f"Refusing to trash file outside of safe zones: {file_path}")
+    if not is_safe_to_trash(trash_dir, logger=logger):
+        logger.warning(f"Refusing to use unsafe trash directory: {trash_dir}")
         return
 
-    trash_dir.mkdir(parents=True, exist_ok=True)
     dest = trash_dir / file_path.name
-
-    # Handle filename collision in trash
     counter = 1
     while dest.exists():
         dest = trash_dir / f"{file_path.stem}_{counter}{file_path.suffix}"
         counter += 1
 
     if dry_run:
-        logging.info(f"[DRY RUN] Moved to trash: {file_path.name} -> {dest.name}")
+        logger.info(f"Would move to trash: {file_path.name} -> {dest.name}")
         return
 
+    trash_dir.mkdir(parents=True, exist_ok=True)
     file_path.rename(dest)
-    logging.info(f"Moved to trash: {file_path.name} -> {dest.name}")
+    logger.info(f"Moved to trash: {file_path.name} -> {dest.name}")
 
-def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
-    logging.info(f"Scanning for non-English (forced) segments in: {file_path.name}")
-    if dry_run:
-        logging.info(f"[DRY RUN] Would write forced subtitles to: {output_srt}")
-        return True
+def generate_forced_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False, logger=None) -> bool:
+    logger = logger or logging.getLogger(__name__)
+    logger.info(f"Scanning for non-English (forced) segments in: {file_path.name}")
 
     try:
+        require_safe_path(output_srt, "Forced Subtitle Output", logger)
+
+        if dry_run:
+            logger.info(f"Would write forced subtitles to: {output_srt}")
+            return True
+
         model_size = get_whisper_model()
         model = WhisperModel(model_size, compute_type="int8")
-
         segments, _ = model.transcribe(str(file_path), language=None)
 
-        forced_segments = []
-        for i, seg in enumerate(segments):
-            lang = seg.language or "en"
-            if lang != "en":
-                start = datetime.timedelta(seconds=seg.start)
-                end = datetime.timedelta(seconds=seg.end)
-                text = seg.text.strip()
-                forced_segments.append(Subtitle(index=i+1, start=start, end=end, content=text))
+        forced_segments = [
+            Subtitle(index=i + 1,
+                     start=datetime.timedelta(seconds=seg.start),
+                     end=datetime.timedelta(seconds=seg.end),
+                     content=seg.text.strip())
+            for i, seg in enumerate(segments)
+            if (seg.language or "en") != "en"
+        ]
 
         if not forced_segments:
-            logging.info("No non-English speech found.")
+            logger.info("No non-English speech found.")
             return False
 
         output_srt.write_text(compose(forced_segments), encoding="utf-8")
-        logging.info(f"Forced subtitles saved: {output_srt.name}")
+        logger.info(f"Forced subtitles saved: {output_srt.name}")
         return True
 
     except Exception as e:
-        logging.warning(f"Whisper (forced) generation failed: {e}")
+        logger.warning(f"Whisper (forced) generation failed: {e}")
         return False
 
-def generate_normal_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False) -> bool:
-    logging.info(f"Generating full transcription subtitles for: {file_path.name}")
-    if dry_run:
-        logging.info(f"[DRY RUN] Would write normal subtitles to: {output_srt}")
-        return True
+def generate_normal_subtitles_from_audio(file_path: Path, output_srt: Path, dry_run: bool = False, logger=None) -> bool:
+    logger = logger or logging.getLogger(__name__)
+    logger.info(f"Generating full transcription subtitles for: {file_path.name}")
 
     try:
+        require_safe_path(output_srt, "Normal Subtitle Output", logger)
+
+        if dry_run:
+            logger.info(f"Would write normal subtitles to: {output_srt}")
+            return True
+
         model_size = get_whisper_model()
         model = WhisperModel(model_size, compute_type="int8")
-
         segments, _ = model.transcribe(str(file_path), language="en")
 
-        srt_segments = []
-        for i, seg in enumerate(segments):
-            start = datetime.timedelta(seconds=seg.start)
-            end = datetime.timedelta(seconds=seg.end)
-            text = seg.text.strip()
-            srt_segments.append(Subtitle(index=i+1, start=start, end=end, content=text))
+        srt_segments = [
+            Subtitle(index=i + 1,
+                     start=datetime.timedelta(seconds=seg.start),
+                     end=datetime.timedelta(seconds=seg.end),
+                     content=seg.text.strip())
+            for i, seg in enumerate(segments)
+        ]
 
         if not srt_segments:
-            logging.warning("No segments generated.")
+            logger.warning("No segments generated.")
             return False
 
         output_srt.write_text(compose(srt_segments), encoding="utf-8")
-        logging.info(f"Normal subtitles saved: {output_srt.name}")
+        logger.info(f"Normal subtitles saved: {output_srt.name}")
         return True
 
     except Exception as e:
-        logging.warning(f"Whisper (normal) generation failed: {e}")
+        logger.warning(f"Whisper (normal) generation failed: {e}")
         return False
 
 def get_whisper_model_dir() -> Path:
@@ -504,100 +541,93 @@ def get_whisper_model_dir() -> Path:
     else:
         return Path.home() / ".mediamender" / "models"
 
-def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: bool = False) -> bool:
+def ensure_whisper_model_installed(model: str, progress_callback=None, dry_run: bool = False, logger=None) -> bool:
     model_dir = get_whisper_model_dir() / model
+    logger = logger or logging.getLogger(__name__)
     if model_dir.exists() and any(model_dir.iterdir()):
-        logging.info(f"Whisper model '{model}' already installed.")
+        logger.info(f"Whisper model '{model}' already installed.")
         return True
-
-    if dry_run:
-        logging.info(f"[DRY RUN] Whisper model '{model}' not found. Would download to: {model_dir}")
-        if progress_callback:
-            progress_callback(0, f"[DRY RUN] Would install Whisper model '{model}'.")
-        return True
-
     try:
-        logging.info(f"Downloading Whisper model: {model} to {model_dir}")
+        logger.info(f"Downloading Whisper model: {model} to {model_dir}")
         if progress_callback:
             progress_callback(0, f"Downloading Whisper model '{model}'...")
 
         # This auto-downloads and caches the model
-        WhisperModel(model, download_root=str(model_dir), compute_type="int8")
+        if not dry_run:
+            WhisperModel(model, download_root=str(model_dir), compute_type="int8")
 
         if progress_callback:
             progress_callback(100, f"Whisper model '{model}' installed.")
         return True
 
     except Exception as e:
-        logging.error(f"Failed to download Whisper model '{model}': {e}")
+        logger.error(f"Failed to download Whisper model '{model}': {e}")
         if progress_callback:
             progress_callback(0, f"Failed to install Whisper model: {e}")
         return False
 
-def find_ffmpeg_path() -> str:
+def find_ffmpeg_path(logger=None) -> str | None:
+    logger = logger or logging.getLogger(__name__)
     try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return "ffmpeg"  # found in PATH
-    except Exception:
-        fallback = Path("resources/ffmpeg/ffmpeg.exe")
-        if fallback.exists():
-            return str(fallback)
+        output = asyncio.run(run_subprocess_capture(["ffmpeg", "-version"], logger=logger))
+        if output:
+            return "ffmpeg"  # Found in system PATH
+    except Exception as e:
+        logger.debug(f"Ffmpeg not found in PATH: {e}")
 
-        return None
+    fallback = Path(FFMPEG_TARGET)
+    if fallback.exists():
+        return str(fallback)
 
-def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False) -> str | None:
+    return None
+
+def install_ffmpeg_if_needed(progress_callback=None, dry_run: bool = False, logger=None) -> str | None:
+    logger = logger or logging.getLogger(__name__)
+
     # 1. Check system PATH
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        logging.info("FFmpeg found in system PATH.")
-        return "ffmpeg"
-    except Exception:
-        pass
+    ffmpeg_path = find_ffmpeg_path(logger=logger)
+    if ffmpeg_path:
+        logger.info("FFmpeg already installed or available in PATH.")
+        return ffmpeg_path
 
     # 2. Check local install
     if FFMPEG_TARGET.exists():
-        logging.info("FFmpeg found in local resources.")
+        logger.info("FFmpeg found in local resources.")
         return str(FFMPEG_TARGET)
 
-    if dry_run:
-        logging.info("[DRY RUN] FFmpeg not found. Would download and install to resources/ffmpeg/")
-        if progress_callback:
-            progress_callback(0, "[DRY RUN] Would install FFmpeg.")
-        return str(FFMPEG_TARGET)
-
-    # 3. Download and install
     try:
         if progress_callback:
             progress_callback(0, "Downloading FFmpeg...")
 
         zip_path = Path("ffmpeg_tmp.zip")
-        request.urlretrieve(FFMPEG_URL, zip_path)
+        if not dry_run:
+            request.urlretrieve(FFMPEG_URL, zip_path)
 
         if progress_callback:
             progress_callback(30, "Extracting FFmpeg...")
 
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall("ffmpeg_tmp")
+        if not dry_run:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall("ffmpeg_tmp")
 
-        extracted = next(Path("ffmpeg_tmp").rglob("ffmpeg.exe"))
-        FFMPEG_TARGET.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(extracted, FFMPEG_TARGET)
+            extracted = next(Path("ffmpeg_tmp").rglob("ffmpeg.exe"))
+            FFMPEG_TARGET.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(extracted, FFMPEG_TARGET)
 
-        # Clean up
-        shutil.rmtree("ffmpeg_tmp")
-        zip_path.unlink()
+            shutil.rmtree("ffmpeg_tmp") # Clean up
+            zip_path.unlink()
 
         if progress_callback:
             progress_callback(100, "FFmpeg installed.")
         return str(FFMPEG_TARGET)
 
     except Exception as e:
-        logging.error(f"Failed to install FFmpeg: {e}")
+        logger.error(f"Failed to install FFmpeg: {e}")
         if progress_callback:
             progress_callback(0, "Failed to install FFmpeg.")
         return None
 
-def parse_chapters_from_srt(srt_path: Path) -> list[tuple[float, float]]:
+def parse_chapters_from_srt(srt_path: Path, logger=None) -> list[tuple[float, float]]:
     """
     Detect chapters from SRT by looking for major time gaps or keyword lines.
     """
@@ -612,9 +642,12 @@ def parse_chapters_from_srt(srt_path: Path) -> list[tuple[float, float]]:
         for i, line in enumerate(lines):
             if "-->" in line:
                 start = line.split("-->")[0].strip()
-                h, m, s = re.split("[:,]", start)
-                start_sec = int(h) * 3600 + int(m) * 60 + int(s)
-                times.append(start_sec)
+                try:
+                    h, m, s = re.split("[:,]", start)
+                    start_sec = int(h) * 3600 + int(m) * 60 + int(s)
+                    times.append(start_sec)
+                except Exception:
+                    continue  # skip bad lines
             elif re.match(r"^(chapter|prologue|epilogue|\d+|[IVXLC]+)\b", line.strip(), re.IGNORECASE):
                 keywords.append(len(times))
 
@@ -633,20 +666,29 @@ def parse_chapters_from_srt(srt_path: Path) -> list[tuple[float, float]]:
                     last = current
             chapters.append((last, None))
     except Exception as e:
-        logging.warning(f"Chapter parsing from SRT failed: {e}")
+        logger.warning(f"Chapter parsing from SRT failed: {e}")
     return chapters
 
-def openlibrary_request(url: str) -> dict:
-    for attempt in range(10):
+async def openlibrary_request(url: str, logger=None, max_retries=10, dry_run=False) -> dict | None:
+    logger = logger or logging.getLogger(__name__)
+
+    if dry_run:
+        logger.info(f"Skipping OpenLibrary request in dry run mode: {url}")
+        return {}
+
+    for attempt in range(1, max_retries + 1):
         try:
             with request.urlopen(url) as response:
-                return json.loads(response.read().decode())
+                data = json.loads(response.read().decode())
+                return data
         except Exception as e:
-            logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
-            time.sleep(20)
-    raise RuntimeError(f"Failed to fetch OpenLibrary data after 10 attempts: {url}")
+            logger.warning(f"[Attempt {attempt}] OpenLibrary request failed: {e}")
+            await asyncio.sleep(2 ** attempt)  # exponential backoff: 2, 4, 8, ..., max
 
-def get_expected_chapter_count(title: str) -> int | None:
+    logger.error(f"Failed to fetch OpenLibrary data after {max_retries} attempts: {url}")
+    return None
+
+def get_expected_chapter_count(title: str, logger=None) -> int | None:
     """
     Uses OpenLibrary to estimate the expected number of chapters for a given title.
     Returns number of ToC entries if available, otherwise None.
@@ -672,28 +714,18 @@ def get_expected_chapter_count(title: str) -> int | None:
                 return len(toc)
 
     except Exception as e:
-        logging.warning(f"OpenLibrary chapter lookup failed: {e}")
+        logger.warning(f"OpenLibrary chapter lookup failed: {e}")
         return None
 
-def openlibrary_request(url: str) -> dict:
-    for attempt in range(10):
-        try:
-            with request.urlopen(url) as response:
-                return json.loads(response.read().decode())
-        except Exception as e:
-            logging.warning(f"[Attempt {attempt+1}] OpenLibrary request failed: {e}")
-            time.sleep(20)
-    raise RuntimeError(f"Failed to fetch OpenLibrary data after 10 attempts: {url}")
-
-def fetch_openlibrary_metadata(title: str) -> dict:
+def fetch_openlibrary_metadata(title: str, logger=None) -> dict:
     """
     Fetch book metadata (title, author, series, cover URL) using OpenLibrary API.
     """
     q = parse.quote(title)
     search_url = f"https://openlibrary.org/search.json?title={q}&has_fulltext=true&language=eng"
-    data = openlibrary_request(search_url)
-
+    data = asyncio.run(openlibrary_request(search_url, logger=logger))
     if not data.get("docs"):
+        logger.warning("No metadata returned from OpenLibrary.")
         return {}
 
     doc = data["docs"][0]
@@ -728,74 +760,54 @@ def build_audiobook_filename(metadata: dict) -> str:
 
     return ", ".join(parts[:-1]) + f" {parts[-1]}.m4b"
 
-def get_output_path_for_media(media_type: str, metadata: dict, base_output_dir: Path, dry_run: bool = False) -> Path | None:
+def get_output_path_for_media(media_type: str, metadata: dict, base_output_dir: Path, dry_run: bool = False, logger=None) -> Path | None:
     """
     Returns and (optionally) creates the output directory path based on media type.
-    Logs the resolved path and respects dry run. If media_type is unsupported, logs and returns None.
+    Logs the resolved path and respects dry run. If media_type is unsupported or path is unsafe, returns None.
     """
+    logger = logger or logging.getLogger(__name__)
     media_type = media_type.lower()
 
-    if media_type == "movie":
-        dest_dir = base_output_dir / "Movies"
+    try:
+        if media_type == "movie":
+            dest_dir = base_output_dir / "Movies"
 
-    elif media_type == "audiobook":
-        dest_dir = base_output_dir / "Audiobooks"
+        elif media_type == "audiobook":
+            dest_dir = base_output_dir / "Audiobooks"
 
-    elif media_type == "show":
-        show_title = metadata.get("show_title", "Unknown Show").strip()
-        season_number = metadata.get("season_number", 1)
-        season_str = f"Season {int(season_number):02d}"
-        dest_dir = base_output_dir / "Shows" / show_title / season_str
+        elif media_type == "show":
+            show_title = metadata.get("show_title", "Unknown Show").strip()
+            season_number = metadata.get("season_number", 1)
+            season_str = f"Season {int(season_number):02d}"
+            dest_dir = base_output_dir / "Shows" / show_title / season_str
 
-    else:
-        logging.warning(f"Unsupported media type '{media_type}'. Skipping.")
+        else:
+            logger.warning(f"Unsupported media type '{media_type}'. Skipping.")
+            return None
+
+        require_safe_path(dest_dir, f"{media_type.capitalize()} Output", logger=logger)
+
+        if dry_run:
+            logger.info(f"Would use/create output directory: {dest_dir}")
+        else:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created or confirmed output directory: {dest_dir}")
+
+        return dest_dir
+
+    except RuntimeError:
+        logger.error(f"Output path rejected for media type '{media_type}': {dest_dir}")
         return None
 
-    if dry_run:
-        logging.info(f"[DRY RUN] Would use/create output directory: {dest_dir}")
-    else:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created or confirmed output directory: {dest_dir}")
+async def convert_subtitle(original, converted, logger):
+    cmd = ["ffmpeg", "-y", "-i", str(original), str(converted)]
+    await stream_subprocess(cmd, logger=logger)
 
-    return dest_dir
-
-def is_safe_to_trash(path: Path) -> bool:
-    try:
-        path = path.resolve()
-        system_drive = Path(path.anchor).resolve()  # e.g., "C:\", "/"
-
-        # 1. Block root of OS
-        if path == system_drive:
-            logging.warning(f"Refusing to trash system root: {path}")
-            return False
-
-        # 2. Define allowed base folders (Windows known user folders)
-        user_home = Path.home()
-        safe_folders = [
-            user_home / "Documents",
-            user_home / "Desktop",
-            user_home / "Downloads",
-            user_home / "Pictures",
-            user_home / "Music",
-            user_home / "Videos"
-        ]
-        safe_folders = [p.resolve() for p in safe_folders if p.exists()]
-
-        # 3. Allow if in any of the safe user folders
-        for safe in safe_folders:
-            if safe in path.parents:
-                logging.debug(f"Safe: {safe}")
-                return True
-
-        # 4. Allow if file is within a folder whose name includes "MediaMender"
-        for parent in path.parents:
-            logging.debug(f"Parent: {parent}")
-            if "mediamender" in parent.name.lower():
-                return True
-
-        logging.warning(f"Refusing to trash file outside of safe zones: {path}")
-        return False
-
-    except Exception as e:
-        logging.warning(f"Could not verify safety for {path}: {e}")
-        return False
+#async def detect_aspect_ratio(file_path: Path, logger=None) -> str:
+#    cmd = [
+#        "ffprobe", "-v", "error", "-select_streams", "v:0",
+#        "-show_entries", "stream=width,height",
+#        "-of", "csv=s=x:p=0", str(file_path)
+#    ]
+#    output = await run_subprocess_capture(cmd, logger=logger)
+#    return output.strip() if output else "Unknown"

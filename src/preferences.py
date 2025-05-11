@@ -1,7 +1,7 @@
 import logging
 import os
 import json
-import shutil
+#import shutil
 from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.logging_utils import configure_logger
+from src.system.safety import is_safe_path, require_safe_path
 from src.theme_manager import ThemeMode
 from src.dialog import ThemedMessage
 from src.system.gpu_utils import (
@@ -37,12 +38,13 @@ DEFAULT_CONFIG = {
 }
 
 class PreferencesWindow(QDialog):
-    def __init__(self, parent=None, on_theme_changed=None):
+    def __init__(self, parent=None, on_theme_changed=None, logger=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
         self.setMinimumWidth(400)
         self.on_theme_changed = on_theme_changed
         self.load_config()
+        self.logger = logger or logging.getLogger(__name__)
 
         layout = QVBoxLayout()
 
@@ -141,9 +143,10 @@ class PreferencesWindow(QDialog):
         if path:
             field.setText(path)
 
-    def load_config(self):
+    def load_config(self, logger=None):
+        logger = logger or logging.getLogger(__name__)
         if not CONFIG_PATH.exists():
-            logging.warning("Config file missing. Using default settings.")
+            logger.warning("Config file missing. Using default settings.")
             self.config = DEFAULT_CONFIG.copy()
             return
 
@@ -151,7 +154,7 @@ class PreferencesWindow(QDialog):
             with open(CONFIG_PATH, "r") as f:
                 loaded = json.load(f)
         except json.JSONDecodeError:
-            logging.error("Config file is corrupted. Using default settings.")
+            logger.error("Config file is corrupted. Using default settings.")
             self.config = DEFAULT_CONFIG.copy()
             return
 
@@ -174,6 +177,24 @@ class PreferencesWindow(QDialog):
         self.config["dry_run"] = self.dry_run_checkbox.isChecked()
         self.config["gpu_enabled"] = self.gpu_checkbox.isChecked()
         self.config["theme"] = self.theme_combo.currentText().lower()
+
+        invalid = []
+
+        paths_to_check = [
+            ("Input Directory", self.input_field["field"].text()),
+            ("Output Directory", self.output_field["field"].text()),
+            ("Trash Directory", self.trash_field["field"].text()),
+            ("Log Directory", self.log_path_field["field"].text()),
+        ]
+
+        for label, path_str in paths_to_check:
+            path = Path(path_str.strip())
+            if not is_safe_path(path, logger=self.logger):
+                invalid.append(f"{label}: {path}")
+
+        if invalid:
+            ThemedMessage.critical(self, "Invalid Paths", "The following paths are unsafe:\n\n" + "\n".join(invalid))
+            return  # Abort save
 
         os.makedirs(CONFIG_PATH.parent, exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
@@ -233,6 +254,7 @@ def get_log_path() -> Path:
     config = _load_config()
     raw = config.get("log_dir", "logs")
     path = Path(raw)
+    require_safe_path(path, "Log Directory")
     path.mkdir(exist_ok=True, parents=True)
     return path
 
@@ -243,7 +265,6 @@ def get_whisper_model() -> str:
 def is_generation_allowed() -> bool:
     config = _load_config()
     return config.get("allow_generation", False)
-
 
 def after_preferences_saved(config, dry_run=False):
     if not config.get("gpu_enabled", False):
@@ -317,28 +338,3 @@ def after_preferences_saved(config, dry_run=False):
     else:
         config["gpu_enabled"] = False
         _write_config(config)
-
-def reinitialize_logger(new_log_dir: Path):
-    global CURRENT_LOG_FILE
-
-    # Ensure new directory exists
-    new_log_dir.mkdir(parents=True, exist_ok=True)
-
-    new_log_path = new_log_dir / CURRENT_LOG_FILE.name
-
-    # Copy existing log file to new location
-    shutil.copy2(CURRENT_LOG_FILE, new_log_path)
-
-    # Reconfigure logging to new file
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-        handler.close()
-
-    logging.basicConfig(
-        filename=new_log_path,
-        filemode="a",
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
-
-    CURRENT_LOG_FILE = new_log_path

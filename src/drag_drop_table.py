@@ -10,6 +10,9 @@ from models.media_item import MediaItem
 from processing.media_processor import detect_media_type
 import logging
 
+from src.system.safety import is_safe_path
+
+
 class DragDropItemModel(QStandardItemModel):
     def supportedDragActions(self):
         return Qt.MoveAction
@@ -22,7 +25,7 @@ class DragDropItemModel(QStandardItemModel):
 
     def dropMimeData(self, data, action, row, column, parent):
         if column == 0:
-            logging.warning("Attempted drop into column 0 (row numbers)")
+            self.logger.warning("Attempted drop into column 0 (row numbers)")
             return False  # prevent corruption
         return super().dropMimeData(data, action, row, column, parent)
 
@@ -36,9 +39,10 @@ class DragDropSortableTable(QTreeView):
     row_remove_requested = Signal(int)
     files_dropped = Signal(tuple)  # (file_paths, target_row)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, logger=None):
         super().__init__(parent)
 
+        self.logger = logger or logging.getLogger(__name__)
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
@@ -74,7 +78,7 @@ class DragDropSortableTable(QTreeView):
             row_items = [
                 QStandardItem(""),  # Column 0: Row number
                 QStandardItem(f"📁 {item.basename}" if item.is_folder else item.basename),  # Column 1: Tree
-                QStandardItem("Folder" if item.is_folder else detect_media_type(item.path)),
+                QStandardItem("Folder" if item.is_folder else detect_media_type(item.path, logger=self.logger)),
                 QStandardItem(item.status)
             ]
             for q in row_items:
@@ -122,15 +126,23 @@ class DragDropSortableTable(QTreeView):
 
     def dropEvent(self, event):
         if event.mimeData().hasUrls():
-            file_paths = [
-                url.toLocalFile()
-                for url in event.mimeData().urls()
-                if url.isLocalFile()
-            ]
+            raw_paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+            safe_paths = []
+            for path_str in raw_paths:
+                path = Path(path_str)
+                if is_safe_path(path, logger=self.logger):
+                    safe_paths.append(path_str)
+                else:
+                    self.logger.warning(f"Refused to accept unsafe dropped path: {path}")
+
+            if not safe_paths:
+                self.logger.warning("All dropped files were unsafe. Ignoring drop event.")
+                return
+
             pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
             index = self.indexAt(pos)
             target_row = index.row() if index.isValid() else -1
-            self.files_dropped.emit((file_paths, target_row))
+            self.files_dropped.emit((safe_paths, target_row))
             event.acceptProposedAction()
             return
 

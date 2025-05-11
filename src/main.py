@@ -27,6 +27,7 @@ from src.style import get_base_stylesheet
 from src.theme_manager import apply_theme
 from src.logging_utils import configure_logger, CURRENT_LOG_FILE
 from models.media_item import MediaItem, get_media_items
+from src.system.safety import require_safe_path
 
 
 gui_lock = threading.Lock()
@@ -34,12 +35,23 @@ CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 log_dir = get_log_path()
 configure_logger(log_dir)
 
+class DryRunLoggingAdapter(logging.LoggerAdapter):
+    def __init__(self, logger, dry_run=False):
+        super().__init__(logger, {})
+        self.dry_run = dry_run
+
+    def process(self, msg, kwargs):
+        if self.dry_run:
+            return f"[DRY RUN] {msg}", kwargs
+        return msg, kwargs
+
 class WorkerThread(QThread):
     update_progress = Signal(int, str)
     file_done = Signal(int, bool)
 
-    def __init__(self, files, output_dir, trash_dir, log_dir, dry_run=False):
+    def __init__(self, files, output_dir, trash_dir, log_dir, dry_run=False, logger=None):
         super().__init__()
+        self.logger = logger or logging.getLogger(__name__)
         self.files = files
         self.output_dir = output_dir
         self.trash_dir = trash_dir
@@ -56,11 +68,11 @@ class WorkerThread(QThread):
             self.update_progress.emit(int((i + 1) / len(self.files) * 100), filename)
 
             try:
-                process_media(Path(file), self.output_dir, self.trash_dir, self.dry_run)
-                logging.info(f"{'[DRY RUN] ' if self.dry_run else ''}Processed file: {filename}")
+                process_media(Path(file), self.output_dir, self.trash_dir, self.dry_run, logger=self.logger)
+                self.logger.info(f"Processed file: {filename}")
                 success = True
             except Exception as e:
-                logging.exception(f"Error processing {filename}")
+                self.logger.exception(f"Error processing {filename}")
                 success = False
 
             self.file_done.emit(i, success)
@@ -78,6 +90,9 @@ class MediaMender(QMainWindow):
 
         self.media_items: list[MediaItem] = []
         self.config = self.load_config()
+
+        self.dry_run = self.config.get("dry_run", True)
+        self.logger = DryRunLoggingAdapter(logging.getLogger(__name__), dry_run=self.dry_run)
 
         self.setup_ui()
 
@@ -264,7 +279,7 @@ class MediaMender(QMainWindow):
             name = path.name.lower()
 
             if name in existing_filenames:
-                logging.info(f"Skipped duplicate file: {name}")
+                self.logger.info(f"Skipped duplicate file: {name}")
                 ThemedMessage.critical(self, "Duplicate File", f"The file '{name}' is already in the queue.")
                 continue
 
@@ -299,11 +314,19 @@ class MediaMender(QMainWindow):
             self.media_items.clear()
             self.table.model.removeRows(0, self.table.model.rowCount())
             self.renumber_table()
-            logging.info("All files have been unloaded.")
+            self.logger.info("All files have been unloaded.")
 
     def load_files(self):
         config = _load_config()
         input_dir = Path(config.get("input_dir", ""))
+
+        try:
+            require_safe_path(input_dir, "Input Directory", logger=self.logger)
+        except RuntimeError:
+            self.logger.error("Input directory rejected for safety reasons.")
+            ThemedMessage("Invalid Directory", "Input directory rejected for safety reasons.", self).exec()
+            return
+
         if not input_dir.exists():
             ThemedMessage("Invalid Directory", "The input directory does not exist.", self).exec()
             return
@@ -342,9 +365,9 @@ class MediaMender(QMainWindow):
         if 0 <= row < len(self.media_items):
             removed_path = self.media_items.pop(row)
             filename = Path(removed_path).name
-            logging.info(f"Removed file from queue: {filename}")
+            self.logger.info(f"Removed file from queue: {filename}")
         else:
-            logging.warning(f"Tried to remove invalid row: {row}")
+            self.logger.warning(f"Tried to remove invalid row: {row}")
 
         self.table.model.removeRow(row)
 
@@ -426,14 +449,31 @@ class MediaMender(QMainWindow):
 
     def check_required_paths(self) -> bool:
         config = _load_config()
-        required_keys = ["input_dir", "output_dir", "trash_dir", "log_dir"]
-        missing = [key for key in required_keys if not config.get(key) or not Path(config[key]).exists()]
-        if missing:
+
+        try:
+            self.input_dir = Path(config.get("input_dir", "input")).resolve()
+            self.output_dir = Path(config.get("output_dir", "output")).resolve()
+            self.trash_dir = Path(config.get("trash_dir", "trash")).resolve()
+            self.log_dir = Path(config.get("log_dir", "logs")).resolve()
+            self.dry_run = config.get("dry_run", True)
+
+            paths = [
+                ("Input Directory", self.input_dir),
+                ("Output Directory", self.output_dir),
+                ("Trash Directory", self.trash_dir),
+                ("Log Directory", self.log_dir),
+            ]
+
+            for name, path in paths:
+                if not path.exists():
+                    self.logger.error(f"{name} does not exist: {path}")
+                    return False
+                require_safe_path(path, name, logger=self.logger)
+
+        except RuntimeError as e:
+            self.logger.error(str(e))
             return False
-        self.output_dir = Path(config.get("output_dir", "output"))
-        self.trash_dir = Path(config.get("trash_dir", "trash"))
-        self.log_dir = Path(config.get("log_dir", "logs"))
-        self.dry_run = config.get("dry_run", True)
+
         return True
 
     def update_file_order(self):
