@@ -8,6 +8,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Generator, Iterable
 
 # --- Third-Party ---
 from PySide6.QtCore import QThread, Signal, Qt, QSize
@@ -33,7 +34,7 @@ from src.system.safety import require_safe_path
 gui_lock = threading.Lock()
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 log_dir = get_log_path()
-configure_logger(log_dir)
+configure_logger(log_dir, level=logging.DEBUG)
 
 class DryRunLoggingAdapter(logging.LoggerAdapter):
     def __init__(self, logger, dry_run=False):
@@ -271,28 +272,44 @@ class MediaMender(QMainWindow):
 
     def add_files_from_drop(self, data):
         file_paths, target_row = data
-        existing_filenames = {item.basename.lower() for item in self.media_items}
+
+        if not file_paths:
+            self.logger.info("Dropped file list was empty.")
+            return
+
+        # Step 1: Wrap into MediaItems
         new_items = []
+        for p in file_paths:
+            try:
+                new_items.append(MediaItem(path=Path(p), source='drag'))
+            except Exception as e:
+                self.logger.warning(f"[DROP] Failed to create MediaItem for {p}: {e}")
+                ThemedMessage.critical(self, "Invalid File", f"Could not load file:\n{p}")
 
-        for path_str in file_paths:
-            path = Path(path_str).resolve()
-            name = path.name.lower()
+        if not new_items:
+            self.logger.info("No valid files to process after drop.")
+            return
 
-            if name in existing_filenames:
-                self.logger.info(f"Skipped duplicate file: {name}")
-                ThemedMessage.critical(self, "Duplicate File", f"The file '{name}' is already in the queue.")
-                continue
+        deduplicated_new_items = self.filter_new_media_items(new_items)
+        if not deduplicated_new_items:
+            self.logger.info("No new files were added from drop.")
+            return
 
-            item = MediaItem(path=path, source='drag')
-            new_items.append(item)
-            existing_filenames.add(name)
-
-        # Insert at target_row
+        # Insert deduplicated items
         if target_row == -1:
-            self.media_items.extend(new_items)
+            self.media_items.extend(deduplicated_new_items)
         else:
-            self.media_items[target_row:target_row] = new_items
+            self.media_items[target_row:target_row] = deduplicated_new_items
+
         self.table.load_items(self.media_items)
+
+        #skipped_count = len(new_items) - len(deduplicated_new_items)
+        #if skipped_count > 0:
+        #    ThemedMessage.critical(
+        #        self,
+        #        "Duplicate Files Skipped",
+        #        f"{skipped_count} duplicate file(s) were skipped. :)"
+        #    )
 
     def open_preferences(self):
         pref = PreferencesWindow(self)
@@ -336,30 +353,75 @@ class MediaMender(QMainWindow):
 
         # Load new items from folder
         new_items = get_media_items(input_dir, source='load')
-        all_items = self.media_items + new_items
 
         # Filter duplicates by filename (case-insensitive)
-        seen = set()
-        filtered = []
-        duplicate_count = 0
-
-        for item in all_items:
-            name = item.basename.lower()
-            if name in seen:
-                duplicate_count += 1
-                continue
-            seen.add(name)
-            filtered.append(item)
-
-        self.media_items = filtered
+        deduplicated_items = self.filter_new_media_items(new_items)
+        if deduplicated_items:
+            self.media_items.extend(deduplicated_items)
+            self.table.load_items(self.media_items)
+        else:
+            self.logger.info("All loaded files were duplicates. No items added.")
         self.table.load_items(self.media_items)
 
-        if duplicate_count > 0:
+        #skipped_count = len(new_items) - len(deduplicated_items)
+        #if skipped_count > 0:
+        #    ThemedMessage.critical(
+        #        self,
+        #        "Duplicate Files Skipped",
+        #        f"{skipped_count} duplicate file(s) were skipped. :)"
+        #    )
+
+    def filter_new_media_items(self, new_items: Iterable['MediaItem']) -> list['MediaItem']:
+        """
+        Filters out MediaItems whose resolved file paths already exist in self.media_items.
+        Folders are accepted but never deduplicated or skipped.
+        """
+        try:
+            existing_paths = {item.path.resolve(strict=True) for item in self.media_items if not item.path.is_dir()}
+        except Exception as e:
+            self.logger.error(f"Failed to resolve existing media paths: {e}")
+            existing_paths = set()
+
+        deduplicated = []
+        skipped = 0
+        new_paths_seen = set()
+
+        for item in new_items:
+            try:
+                resolved = item.path.resolve(strict=True)
+            except Exception as e:
+                self.logger.warning(f"Failed to resolve path: {item.path} — {e}")
+                continue
+
+            self.logger.debug(f"[COMPARE] Resolved new: {resolved}")
+
+            if item.path.is_dir():
+                self.logger.debug(f"[FOLDER] Accepted folder (no dedup): {resolved}")
+                deduplicated.append(item)
+                continue
+
+            if resolved in existing_paths:
+                self.logger.info(f"[SKIPPED] Duplicate file (exact path): {resolved}")
+                skipped += 1
+                continue
+
+            if resolved in new_paths_seen:
+                self.logger.info(f"[SKIPPED] Duplicate within new batch: {resolved}")
+                skipped += 1
+                continue
+
+            self.logger.debug(f"[ADDED] Accepted new file: {resolved}")
+            new_paths_seen.add(resolved)
+            deduplicated.append(item)
+
+        if skipped:
             ThemedMessage.critical(
                 self,
-                "Duplicate Files Skipped",
-                f"{duplicate_count} duplicate file(s) were skipped based on filename."
+                "Duplicate File(s)",
+                f"{skipped} file(s) were skipped because they already exist in the queue or batch."
             )
+
+        return deduplicated
 
     def remove_file_at_row(self, row):
         if 0 <= row < len(self.media_items):

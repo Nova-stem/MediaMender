@@ -54,6 +54,54 @@ class MediaItem:
 
 def get_media_items(base_path: Path, source: str, logger=None) -> list[MediaItem]:
     items = []
+    seen = set()
+    logger = logger or logging.getLogger(__name__)
+
+    try:
+        require_safe_path(base_path, "Media Input Root", logger=logger)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return []
+
+    for root, dirs, files in os.walk(base_path):
+        root_path = Path(root)
+
+        # Add the current folder
+        try:
+            resolved = root_path.resolve(strict=True)
+            if resolved not in seen:
+                items.append(MediaItem(path=root_path, source=source, root=base_path))
+                seen.add(resolved)
+        except Exception as e:
+            logger.warning(f"[get_media_items] Failed to resolve folder {root_path}: {e}")
+
+        # Add subfolders
+        for d in dirs:
+            folder_path = root_path / d
+            try:
+                resolved = folder_path.resolve(strict=True)
+                if resolved not in seen:
+                    items.append(MediaItem(path=folder_path, source=source, root=base_path))
+                    seen.add(resolved)
+            except Exception as e:
+                logger.warning(f"[get_media_items] Failed to resolve subfolder {folder_path}: {e}")
+
+        # Add files
+        for f in files:
+            file_path = root_path / f
+            try:
+                resolved = file_path.resolve(strict=True)
+                if resolved not in seen:
+                    items.append(MediaItem(path=file_path, source=source, root=base_path))
+                    seen.add(resolved)
+            except Exception as e:
+                logger.warning(f"[get_media_items] Failed to resolve file {file_path}: {e}")
+
+    return items
+
+
+def get_media_items_OLD(base_path: Path, source: str, logger=None) -> list[MediaItem]:
+    items = []
     logger = logger or logging.getLogger(__name__)
     try:
         require_safe_path(base_path, "Media Input Root", logger=logger)
