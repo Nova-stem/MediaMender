@@ -1,4 +1,6 @@
 # /src/dialog.py
+#23 May 2025
+
 #from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
 #from PySide6.QtCore import Qt
 

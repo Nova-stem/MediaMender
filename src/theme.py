@@ -1,3 +1,6 @@
+#src/theme.py
+#23 May 2025
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtCore import Qt

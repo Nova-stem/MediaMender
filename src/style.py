@@ -1,3 +1,6 @@
+#src/style.py
+#23 May 2025
+
 def get_base_stylesheet() -> str:
     return """
     QWidget {

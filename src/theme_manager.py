@@ -1,3 +1,6 @@
+#src/theme_manage.py
+#23 May 2025
+
 from enum import Enum
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPalette, QColor
