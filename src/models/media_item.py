@@ -36,6 +36,7 @@ class MediaItem:
             except Exception:
                 self.group_path = None
                 self.group_id = None
+        self.indent_level = self.depth  # <-- 🔥 ADD THIS LINE HERE
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +51,7 @@ class MediaItem:
             "depth": self.depth,
             "group_id": self.group_id,
             "group_path": str(self.group_path) if self.group_path else None,
+            "indent_level": self.indent_level,
         }
 
     def __repr__(self):
